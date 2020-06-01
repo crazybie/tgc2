@@ -33,11 +33,6 @@ void ObjMeta::operator delete(void* p) {
   m->klass->memHandler(m->klass, ClassMeta::MemRequest::Dealloc, m);
 }
 
-bool ObjMeta::operator<(ObjMeta& r) const {
-  return objPtr() + klass->size * arrayLength <
-         r.objPtr() + r.klass->size * r.arrayLength;
-}
-
 bool ObjMeta::containsPtr(char* p) {
   auto* o = objPtr();
   return o <= p && p < o + klass->size * arrayLength;
@@ -72,28 +67,40 @@ PtrBase::PtrBase(void* obj) {
   c->registerToOwnerClass(this);
 }
 
+PtrBase::~PtrBase() {
+  if (isRoot()) {
+    if (meta && meta->rootRefs > 0)
+      meta->rootRefs--;
+  }
+}
+
 void PtrBase::onPtrChanged() {
   Collector::inst->onPointerChanged(this);
 }
 
 //////////////////////////////////////////////////////////////////////////
 
-ObjMeta* ClassMeta::newMeta(size_t objCnt) {
-  assert(memHandler && "should not be called in global scope (before main)");
-  auto* meta = (ObjMeta*)memHandler(this, MemRequest::Alloc,
-                                    reinterpret_cast<void*>(objCnt));
+ObjMeta* ClassMeta::newMeta(size_t cnt) {
+  auto* c = Collector::inst ? Collector::inst : Collector::get();
+  if (c->newGen.size() % c->newGenSizeForCollect == 0)
+    c->collect();
 
+  ObjMeta* meta = nullptr;
   try {
-    auto* c = Collector::inst ? Collector::inst : Collector::get();
-    // Allow using gc_from(this) in the constructor of the creating object.
-    c->addMeta(meta);
+    assert(memHandler && "should not be called in global scope (before main)");
+    if (memHandler) {
+      isCreatingObj++;
+      meta = (ObjMeta*)memHandler(this, MemRequest::Alloc,
+                                  reinterpret_cast<void*>(cnt));
+
+      // Allow using gc_from(this) in the constructor of the creating object.
+      c->addMeta(meta);
+    }
+    return meta;
   } catch (std::bad_alloc&) {
     memHandler(this, MemRequest::Dealloc, meta);
     throw;
   }
-
-  isCreatingObj++;
-  return meta;
 }
 
 void ClassMeta::endNewMeta(ObjMeta* meta, bool failed) {
@@ -115,7 +122,6 @@ void ClassMeta::endNewMeta(ObjMeta* meta, bool failed) {
 
 void ClassMeta::registerSubPtr(ObjMeta* owner, PtrBase* p) {
   auto offset = (OffsetType)((char*)p - owner->objPtr());
-
   {
     if (state == ClassMeta::State::Registered)
       return;
@@ -134,15 +140,15 @@ void ClassMeta::registerSubPtr(ObjMeta* owner, PtrBase* p) {
 Collector::Collector() {
   newGen.reserve(1024 * 10);
   oldGen.reserve(1024 * 10);
-  intergenerationalObjs.reserve(1024);
+  intergenerationalObjs.reserve(1024 * 10);
 }
 
 Collector::~Collector() {
-  for (auto i = newGen.begin(); i != newGen.end();) {
-    delete *i;
+  for (auto i : newGen) {
+    delete i;
   }
-  for (auto i = oldGen.begin(); i != oldGen.end();) {
-    delete *i;
+  for (auto i : oldGen) {
+    delete i;
   }
 }
 
@@ -175,13 +181,11 @@ void Collector::registerToOwnerClass(PtrBase* p) {
 void Collector::onPointerChanged(PtrBase* p) {
   if (!p->meta)
     return;
-  p->meta->isRoot = p->isRoot();
-  if (oldGen.find(p->owner) != oldGen.end()) {
-    intergenerationalObjs.insert(p->meta);
+  if (p->isRoot())
+    p->meta->rootRefs++;
+  else if (oldGen.find(p->owner) != oldGen.end()) {
+    intergenerationalObjs.insert(p->owner);
   }
-
-  if (newGen.size() > 1024)
-    collectNewGen();
 }
 
 ObjMeta* Collector::findCreatingObj(PtrBase* p) {
@@ -201,30 +205,42 @@ ObjMeta* Collector::globalFindOwnerMeta(void* obj) {
 void Collector::mark(ObjMeta* meta) {
   if (meta->color == ObjMeta::Color::White) {
     meta->color = ObjMeta::Color::Black;
+    markChildren(meta);
+  }
+}
 
-    for (auto it = meta->klass->enumPtrs(meta); auto* ptr = it->getNext();) {
-      if (auto* meta = ptr->meta) {
-        meta->isRoot = false;  // for containers
-        if (meta->color == ObjMeta::Color::White) {
-          meta->color = ObjMeta::Color::Black;
-        }
-      }
+void Collector::markChildren(ObjMeta* meta) {
+  auto* it = meta->klass->enumPtrs(meta);
+  for (; auto* child = it->getNext();) {
+    if (auto* m = child->meta) {
+      m->rootRefs = 0;  // for container elements.
+      m->color = ObjMeta::Color::Black;
     }
   }
+  delete it;
 }
 
 void Collector::collectNewGen() {
   for (auto meta : newGen) {
-    if (meta->isRoot) {
+    // for containers
+    IPtrEnumerator* it;
+    for (it = meta->klass->enumPtrs(meta); auto* ptr = it->getNext();) {
+      if (auto* e = ptr->meta) {
+        e->rootRefs = 0;
+      }
+    }
+    delete it;
+
+    if (meta->isRoot()) {
       mark(meta);
     }
   }
+
   for (auto meta : intergenerationalObjs) {
-    mark(meta);
+    markChildren(meta);
   }
 
-  freeObjCntOfPrevGc = 0;
-  sweep(newGen, true);
+  sweep(newGen, false);
 }
 
 int Collector::sweep(MetaSet& gen, bool full) {
@@ -245,9 +261,10 @@ int Collector::sweep(MetaSet& gen, bool full) {
     } else {
       meta->color = ObjMeta::Color::White;
 
-      if (full && meta->scanCountInNewGen++ > 3) {
-        promote(meta);
+      if (!full && ++meta->scanCountInNewGen >= oldGenScanCount) {
         meta->scanCountInNewGen = 0;
+
+        promote(meta);
         it = newGen.erase(it);
       } else
         ++it;
@@ -264,21 +281,22 @@ void Collector::promote(ObjMeta* meta) {
 
 void Collector::fullCollect() {
   for (auto meta : newGen) {
-    if (meta->isRoot) {
+    if (meta->isRoot()) {
       mark(meta);
     }
   }
   for (auto* meta : oldGen) {
-    if (meta->isRoot) {
+    if (meta->isRoot()) {
       mark(meta);
     }
   }
-  freeObjCntOfPrevGc = 0;
-  sweep(newGen, false);
-  oldGenSize -= sweep(oldGen, false);
+
+  sweep(newGen, true);
+  oldGenSize -= sweep(oldGen, true);
 }
 
 void Collector::collect() {
+  freeObjCntOfPrevGc = 0;
   collectNewGen();
   if (oldGenSize > sizeOfOldGenToFullCollect) {
     fullCollect();
@@ -287,8 +305,8 @@ void Collector::collect() {
 
 void Collector::dumpStats() {
   printf("========= [gc] ========\n");
-  printf("[newGen meta     ] %3d\n", (unsigned)newGen.size());
-  printf("[oldGen meta     ] %3d\n", (unsigned)oldGen.size());
+  printf("[newGen meta    ] %3d\n", (unsigned)newGen.size());
+  printf("[oldGen meta    ] %3d\n", (unsigned)oldGen.size());
   auto liveCnt = 0;
   for (auto i : newGen)
     if (i->arrayLength)

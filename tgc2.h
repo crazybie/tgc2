@@ -63,9 +63,9 @@ class ObjMeta {
 
   ClassMeta* klass = nullptr;
   size_t arrayLength = 0;
-  Color color : 2;
-  unsigned char scanCountInNewGen : 3;
-  bool isRoot : 1;
+  unsigned short rootRefs = 0;
+  Color color = Color::White;
+  unsigned char scanCountInNewGen = 0;
 
   ObjMeta(ClassMeta* c, char* o, size_t n)
       : klass(c), arrayLength(n), scanCountInNewGen(0), color(Color::White) {}
@@ -74,7 +74,7 @@ class ObjMeta {
       destroy();
   }
   void operator delete(void* c);
-  bool operator<(ObjMeta& r) const;
+  bool isRoot() const { return rootRefs > 0; }
   bool containsPtr(char* p);
   char* objPtr() const;
   void destroy();
@@ -88,7 +88,6 @@ static_assert(sizeof(ObjMeta) <= sizeof(void*) * 3,
 
 class IPtrEnumerator {
  public:
-  virtual ~IPtrEnumerator() {}
   virtual const PtrBase* getNext() = 0;
 
   void* operator new(size_t sz) {
@@ -200,6 +199,7 @@ class PtrBase {
  protected:
   PtrBase();
   PtrBase(void* obj);
+  ~PtrBase();
 
   void onPtrChanged();
   bool isRoot() const { return !owner; }
@@ -317,7 +317,10 @@ class Collector {
   list<ObjMeta*> creatingObjs;
   int freeObjCntOfPrevGc;
   int oldGenSize = 0;
+
   int sizeOfOldGenToFullCollect = 1024 * 1024 * 1;
+  int oldGenScanCount = 3;
+  int newGenSizeForCollect = 256;
 
   static Collector* inst;
 
@@ -326,7 +329,6 @@ class Collector {
   void fullCollect();
   void collect();
   void dumpStats();
-  void setOldGenSizeToFullCollect(int sz) { sizeOfOldGenToFullCollect = sz; }
 
  private:
   Collector();
@@ -338,6 +340,7 @@ class Collector {
   void registerToOwnerClass(PtrBase* p);
   void onPointerChanged(PtrBase* p);
   void mark(ObjMeta* meta);
+  void markChildren(ObjMeta* meta);
   void collectNewGen();
   ObjMeta* findCreatingObj(PtrBase* p);
   void addMeta(ObjMeta* meta);
@@ -346,6 +349,7 @@ class Collector {
 inline void gc_collect() {
   Collector::get()->collect();
 }
+
 inline void gc_full_collect() {
   Collector::get()->fullCollect();
 }
