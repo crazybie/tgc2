@@ -43,7 +43,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <unordered_map>
 #include <unordered_set>
 
-namespace tgc {
+namespace tgc2 {
 namespace details {
 
 using namespace std;
@@ -200,7 +200,6 @@ class PtrBase {
  protected:
   PtrBase();
   PtrBase(void* obj);
-  ~PtrBase();
 
   void onPtrChanged();
   bool isRoot() const { return !owner; }
@@ -315,23 +314,15 @@ class Collector {
 
   MetaSet intergenerationalObjs;
   MetaSet newGen, oldGen;
-  // stack is no feasible for multi-threaded version.
   list<ObjMeta*> creatingObjs;
   int freeObjCntOfPrevGc;
   int oldGenSize = 0;
+  int sizeOfOldGenToFullCollect = 1024 * 1024 * 1;
 
   static Collector* inst;
-  int sizeOfOldGenToFullCollect = 1024 * 1024 * 10;
 
  public:
   static Collector* get();
-  void onPointerChanged(PtrBase* p);
-  void registerToOwnerClass(PtrBase* p);
-  ObjMeta* globalFindOwnerMeta(void* obj);
-  void mark(ObjMeta* meta);
-  void collectNewGen();
-  int sweep(MetaSet& gen, bool allowPromote);
-  void promote(ObjMeta* meta);
   void fullCollect();
   void collect();
   void dumpStats();
@@ -341,13 +332,22 @@ class Collector {
   Collector();
   ~Collector();
 
-  void tryMarkRoot(PtrBase* p);
+  int sweep(MetaSet& gen, bool full);
+  void promote(ObjMeta* meta);
+  ObjMeta* globalFindOwnerMeta(void* obj);
+  void registerToOwnerClass(PtrBase* p);
+  void onPointerChanged(PtrBase* p);
+  void mark(ObjMeta* meta);
+  void collectNewGen();
   ObjMeta* findCreatingObj(PtrBase* p);
   void addMeta(ObjMeta* meta);
 };
 
 inline void gc_collect() {
   Collector::get()->collect();
+}
+inline void gc_full_collect() {
+  Collector::get()->fullCollect();
 }
 
 inline void gc_dumpStats() {
@@ -668,6 +668,7 @@ using details::gc_collect;
 using details::gc_dumpStats;
 using details::gc_dynamic_pointer_cast;
 using details::gc_from;
+using details::gc_full_collect;
 using details::gc_function;
 using details::gc_new;
 using details::gc_new_array;
@@ -703,4 +704,4 @@ TGC_DECL_AUTO_BOX(long, gc_long);
 TGC_DECL_AUTO_BOX(unsigned long, gc_ulong);
 TGC_DECL_AUTO_BOX(std::string, gc_string);
 
-}  // namespace tgc
+}  // namespace tgc2

@@ -1,10 +1,10 @@
-#include "tgc.h"
+#include "tgc2.h"
 
 #ifdef _WIN32
 #include <crtdbg.h>
 #endif
 
-namespace tgc {
+namespace tgc2 {
 namespace details {
 
 int ClassMeta::isCreatingObj = 0;
@@ -72,8 +72,6 @@ PtrBase::PtrBase(void* obj) {
   c->registerToOwnerClass(this);
 }
 
-PtrBase::~PtrBase() {}
-
 void PtrBase::onPtrChanged() {
   Collector::inst->onPointerChanged(this);
 }
@@ -99,13 +97,14 @@ ObjMeta* ClassMeta::newMeta(size_t objCnt) {
 }
 
 void ClassMeta::endNewMeta(ObjMeta* meta, bool failed) {
+  auto* c = Collector::inst;
+
   isCreatingObj--;
   if (!failed) {
     state = ClassMeta::State::Registered;
   }
 
   {
-    auto* c = Collector::inst;
     c->creatingObjs.remove(meta);
     if (failed) {
       c->newGen.erase(meta);
@@ -180,6 +179,9 @@ void Collector::onPointerChanged(PtrBase* p) {
   if (oldGen.find(p->owner) != oldGen.end()) {
     intergenerationalObjs.insert(p->meta);
   }
+
+  if (newGen.size() > 1024)
+    collectNewGen();
 }
 
 ObjMeta* Collector::findCreatingObj(PtrBase* p) {
@@ -202,6 +204,7 @@ void Collector::mark(ObjMeta* meta) {
 
     for (auto it = meta->klass->enumPtrs(meta); auto* ptr = it->getNext();) {
       if (auto* meta = ptr->meta) {
+        meta->isRoot = false;  // for containers
         if (meta->color == ObjMeta::Color::White) {
           meta->color = ObjMeta::Color::Black;
         }
@@ -224,20 +227,25 @@ void Collector::collectNewGen() {
   sweep(newGen, true);
 }
 
-int Collector::sweep(MetaSet& gen, bool allowPromote) {
+int Collector::sweep(MetaSet& gen, bool full) {
   int freeSizeBytes = 0;
+
   for (auto it = gen.begin(); it != gen.end();) {
     auto* meta = *it;
+
     if (meta->color == ObjMeta::Color::White) {
       freeSizeBytes += meta->sizeInBytes();
-      delete meta;
       freeObjCntOfPrevGc++;
-      it = gen.erase(it);
 
+      delete meta;
+      if (full)
+        intergenerationalObjs.erase(meta);
+
+      it = gen.erase(it);
     } else {
       meta->color = ObjMeta::Color::White;
 
-      if (allowPromote && meta->scanCountInNewGen++ > 3) {
+      if (full && meta->scanCountInNewGen++ > 3) {
         promote(meta);
         meta->scanCountInNewGen = 0;
         it = newGen.erase(it);
@@ -294,4 +302,4 @@ void Collector::dumpStats() {
 }
 
 }  // namespace details
-}  // namespace tgc
+}  // namespace tgc2

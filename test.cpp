@@ -1,11 +1,10 @@
-#include "tgc.h"
+#include "tgc2.h"
 
 #include <assert.h>
 #include <chrono>
 #include <iostream>
-#include <string_view>
 
-using namespace tgc;
+using namespace tgc2;
 using namespace std;
 
 struct b1 {
