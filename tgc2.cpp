@@ -11,6 +11,8 @@ int ClassMeta::isCreatingObj = 0;
 
 Collector* Collector::inst = nullptr;
 
+char ClassMeta::buf[255];
+
 //////////////////////////////////////////////////////////////////////////
 
 char* ObjMeta::objPtr() const {
@@ -210,26 +212,22 @@ void Collector::mark(ObjMeta* meta) {
 }
 
 void Collector::markChildren(ObjMeta* meta) {
-  auto* it = meta->klass->enumPtrs(meta);
-  for (; auto* child = it->getNext();) {
+  for (auto* it = meta->klass->enumPtrs(meta); auto* child = it->getNext();) {
     if (auto* m = child->meta) {
       m->rootRefs = 0;  // for container elements.
       m->color = ObjMeta::Color::Black;
     }
   }
-  delete it;
 }
 
 void Collector::collectNewGen() {
   for (auto meta : newGen) {
     // for containers
-    IPtrEnumerator* it;
-    for (it = meta->klass->enumPtrs(meta); auto* ptr = it->getNext();) {
+    for (auto* it = meta->klass->enumPtrs(meta); auto* ptr = it->getNext();) {
       if (auto* e = ptr->meta) {
         e->rootRefs = 0;
       }
     }
-    delete it;
 
     if (meta->isRoot()) {
       mark(meta);

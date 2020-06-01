@@ -88,14 +88,8 @@ static_assert(sizeof(ObjMeta) <= sizeof(void*) * 3,
 
 class IPtrEnumerator {
  public:
+  virtual ~IPtrEnumerator() {}
   virtual const PtrBase* getNext() = 0;
-
-  void* operator new(size_t sz) {
-    static char buf[255];
-    assert(sz <= sizeof(buf));
-    return buf;
-  }
-  void operator delete(void*) {}
 };
 
 class ObjPtrEnumerator : public IPtrEnumerator {
@@ -147,6 +141,8 @@ class ClassMeta {
   }
 
  private:
+  static char buf[255];
+
   template <typename T>
   struct Holder {
     static void* MemHandler(ClassMeta* cls, MemRequest r, void* param) {
@@ -169,7 +165,7 @@ class ClassMeta {
         } break;
         case MemRequest::NewPtrEnumerator: {
           auto meta = (ObjMeta*)param;
-          return new PtrEnumerator<T>(meta);
+          return new (buf) PtrEnumerator<T>(meta);
         } break;
       }
       return nullptr;
