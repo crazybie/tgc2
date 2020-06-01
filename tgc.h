@@ -34,10 +34,6 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <set>
 #include <typeinfo>
 #include <vector>
-#ifdef TGC_MULTI_THREADED
-#include <atomic>
-#include <shared_mutex>
-#endif
 
 // for STL wrappers
 #include <deque>
@@ -52,28 +48,7 @@ namespace details {
 
 using namespace std;
 
-#ifndef TGC_MULTI_THREADED
-
-constexpr int try_to_lock = 0;
-
-struct shared_mutex {};
-struct unique_lock {
-  unique_lock(...) {}
-};
-struct shared_lock {
-  shared_lock(...) {}
-};
-template <typename T>
-struct atomic {
-  T value;
-  atomic(T v) : value{v} {}
-  void operator++(int) { value++; }
-  void operator--(int) { value--; }
-  operator const T&() const { return value; }
-  bool operator==(const T& r) const { return value == r; }
-};
-
-#endif
+using std::size_t;
 
 class ObjMeta;
 class ClassMeta;
@@ -84,20 +59,16 @@ class IPtrEnumerator;
 
 class ObjMeta {
  public:
-  enum class Color : unsigned char { White, Gray, Black };
-  using LengthType = unsigned short;
-  struct Less {
-    bool operator()(ObjMeta* x, ObjMeta* y) const { return *x < *y; }
-  };
+  enum class Color : unsigned char { White, Black };
 
   ClassMeta* klass = nullptr;
-  atomic<Color> color = Color::White;
-  LengthType arrayLength = 0;
-
-  static char* dummyObjPtr;
+  size_t arrayLength = 0;
+  Color color : 2;
+  unsigned char scanCountInNewGen : 3;
+  bool isRoot : 1;
 
   ObjMeta(ClassMeta* c, char* o, size_t n)
-      : klass(c), arrayLength((LengthType)n) {}
+      : klass(c), arrayLength(n), scanCountInNewGen(0), color(Color::White) {}
   ~ObjMeta() {
     if (arrayLength)
       destroy();
@@ -107,9 +78,10 @@ class ObjMeta {
   bool containsPtr(char* p);
   char* objPtr() const;
   void destroy();
+  size_t sizeInBytes() const;
 };
 
-static_assert(sizeof(ObjMeta) <= sizeof(void*) * 2,
+static_assert(sizeof(ObjMeta) <= sizeof(void*) * 3,
               "too large for small allocation");
 
 //////////////////////////////////////////////////////////////////////////
@@ -156,13 +128,7 @@ class ClassMeta {
   State state = State::Unregistered;
   SizeType size = 0;
 
-#ifdef TGC_MULTI_THREADED
-  shared_mutex mutex;
-#else
-  static shared_mutex mutex;
-#endif
-
-  static atomic<int> isCreatingObj;
+  static int isCreatingObj;
   static ClassMeta dummy;
 
   ClassMeta() {}
@@ -235,12 +201,13 @@ class PtrBase {
   PtrBase();
   PtrBase(void* obj);
   ~PtrBase();
+
   void onPtrChanged();
+  bool isRoot() const { return !owner; }
 
  protected:
   ObjMeta* meta = nullptr;
-  mutable unsigned int isRoot : 1;
-  unsigned int index : 31;
+  ObjMeta* owner = nullptr;
 };
 
 template <typename T>
@@ -310,7 +277,8 @@ class GcPtr : public PtrBase {
   T* p = nullptr;
 };
 
-static_assert(sizeof(GcPtr<int>) <= sizeof(void*) * 3);
+static_assert(sizeof(GcPtr<int>) <= sizeof(void*) * 3,
+              "too large to pass by value");
 
 template <typename T>
 class gc : public GcPtr<T> {
@@ -343,16 +311,31 @@ class Collector {
   friend class ClassMeta;
   friend class PtrBase;
 
+  using MetaSet = unordered_set<ObjMeta*>;
+
+  MetaSet intergenerationalObjs;
+  MetaSet newGen, oldGen;
+  // stack is no feasible for multi-threaded version.
+  list<ObjMeta*> creatingObjs;
+  int freeObjCntOfPrevGc;
+  int oldGenSize = 0;
+
+  static Collector* inst;
+  int sizeOfOldGenToFullCollect = 1024 * 1024 * 10;
+
  public:
   static Collector* get();
   void onPointerChanged(PtrBase* p);
-  void registerPtr(PtrBase* p);
-  void unregisterPtr(PtrBase* p);
+  void registerToOwnerClass(PtrBase* p);
   ObjMeta* globalFindOwnerMeta(void* obj);
-  void collect(int stepCnt);
+  void mark(ObjMeta* meta);
+  void collectNewGen();
+  int sweep(MetaSet& gen, bool allowPromote);
+  void promote(ObjMeta* meta);
+  void fullCollect();
+  void collect();
   void dumpStats();
-
-  enum class State { RootMarking, LeafMarking, Sweeping, MaxCnt };
+  void setOldGenSizeToFullCollect(int sz) { sizeOfOldGenToFullCollect = sz; }
 
  private:
   Collector();
@@ -361,26 +344,10 @@ class Collector {
   void tryMarkRoot(PtrBase* p);
   ObjMeta* findCreatingObj(PtrBase* p);
   void addMeta(ObjMeta* meta);
-
- private:
-  using MetaSet = unordered_set<ObjMeta*>;
-
-  vector<PtrBase*> pointers;
-  vector<ObjMeta*> grayObjs;
-  MetaSet metaSet;
-  // stack is no feasible for multi-threaded version.
-  list<ObjMeta*> creatingObjs;
-  MetaSet::iterator nextSweeping;
-  size_t nextRootMarking = 0;
-  State state = State::RootMarking;
-  shared_mutex mutex;
-  int freeObjCntOfPrevGc;
-
-  static Collector* inst;
 };
 
-inline void gc_collect(int steps = 256) {
-  Collector::get()->collect(steps);
+inline void gc_collect() {
+  Collector::get()->collect();
 }
 
 inline void gc_dumpStats() {

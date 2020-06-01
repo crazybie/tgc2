@@ -7,22 +7,14 @@
 namespace tgc {
 namespace details {
 
-#ifndef TGC_MULTI_THREADED
-shared_mutex ClassMeta::mutex;
-#endif
-atomic<int> ClassMeta::isCreatingObj = 0;
-ClassMeta ClassMeta::dummy;
-char* ObjMeta::dummyObjPtr = nullptr;
-Collector* Collector::inst = nullptr;
+int ClassMeta::isCreatingObj = 0;
 
-static const char* StateStr[(int)Collector::State::MaxCnt] = {
-    "RootMarking", "LeafMarking", "Sweeping"};
+Collector* Collector::inst = nullptr;
 
 //////////////////////////////////////////////////////////////////////////
 
 char* ObjMeta::objPtr() const {
-  return klass == &ClassMeta::dummy ? dummyObjPtr
-                                    : (char*)this + sizeof(ObjMeta);
+  return (char*)this + sizeof(ObjMeta);
 }
 
 void ObjMeta::destroy() {
@@ -30,6 +22,10 @@ void ObjMeta::destroy() {
     return;
   klass->memHandler(klass, ClassMeta::MemRequest::Dctor, this);
   arrayLength = 0;
+}
+
+size_t ObjMeta::sizeInBytes() const {
+  return arrayLength * klass->size;
 }
 
 void ObjMeta::operator delete(void* p) {
@@ -65,20 +61,18 @@ const PtrBase* ObjPtrEnumerator::getNext() {
 
 //////////////////////////////////////////////////////////////////////////
 
-PtrBase::PtrBase() : isRoot(1) {
+PtrBase::PtrBase() {
   auto* c = Collector::inst ? Collector::inst : Collector::get();
-  c->registerPtr(this);
+  c->registerToOwnerClass(this);
 }
 
-PtrBase::PtrBase(void* obj) : isRoot(1) {
+PtrBase::PtrBase(void* obj) {
   auto* c = Collector::inst ? Collector::inst : Collector::get();
   meta = c->globalFindOwnerMeta(obj);
-  c->registerPtr(this);
+  c->registerToOwnerClass(this);
 }
 
-PtrBase::~PtrBase() {
-  Collector::inst->unregisterPtr(this);
-}
+PtrBase::~PtrBase() {}
 
 void PtrBase::onPtrChanged() {
   Collector::inst->onPointerChanged(this);
@@ -107,16 +101,14 @@ ObjMeta* ClassMeta::newMeta(size_t objCnt) {
 void ClassMeta::endNewMeta(ObjMeta* meta, bool failed) {
   isCreatingObj--;
   if (!failed) {
-    unique_lock lk{mutex};
     state = ClassMeta::State::Registered;
   }
 
   {
     auto* c = Collector::inst;
-    unique_lock lk{c->mutex, try_to_lock};
     c->creatingObjs.remove(meta);
     if (failed) {
-      c->metaSet.erase(meta);
+      c->newGen.erase(meta);
       memHandler(this, MemRequest::Dealloc, meta);
     }
   }
@@ -126,8 +118,6 @@ void ClassMeta::registerSubPtr(ObjMeta* owner, PtrBase* p) {
   auto offset = (OffsetType)((char*)p - owner->objPtr());
 
   {
-    shared_lock lk{mutex};
-
     if (state == ClassMeta::State::Registered)
       return;
     // constructor recursed.
@@ -135,7 +125,6 @@ void ClassMeta::registerSubPtr(ObjMeta* owner, PtrBase* p) {
       return;
   }
 
-  unique_lock lk{mutex};
   if (!subPtrOffsets)
     subPtrOffsets = new vector<OffsetType>();
   subPtrOffsets->push_back(offset);
@@ -144,14 +133,17 @@ void ClassMeta::registerSubPtr(ObjMeta* owner, PtrBase* p) {
 //////////////////////////////////////////////////////////////////////////
 
 Collector::Collector() {
-  pointers.reserve(1024 * 5);
-  grayObjs.reserve(1024 * 2);
+  newGen.reserve(1024 * 10);
+  oldGen.reserve(1024 * 10);
+  intergenerationalObjs.reserve(1024);
 }
 
 Collector::~Collector() {
-  for (auto i = metaSet.begin(); i != metaSet.end();) {
+  for (auto i = newGen.begin(); i != newGen.end();) {
     delete *i;
-    i = metaSet.erase(i);
+  }
+  for (auto i = oldGen.begin(); i != oldGen.end();) {
+    delete *i;
   }
 }
 
@@ -168,58 +160,15 @@ Collector* Collector::get() {
 }
 
 void Collector::addMeta(ObjMeta* meta) {
-  unique_lock lk{mutex, try_to_lock};
-  metaSet.insert(meta);
+  newGen.insert(meta);
   creatingObjs.push_back(meta);
 }
 
-void Collector::registerPtr(PtrBase* p) {
-  p->index = pointers.size();
-  {
-    unique_lock lk{mutex, try_to_lock};
-    pointers.push_back(p);
-  }
-
+void Collector::registerToOwnerClass(PtrBase* p) {
   if (ClassMeta::isCreatingObj > 0) {
     if (auto* owner = findCreatingObj(p)) {
-      p->isRoot = 0;
+      p->owner = owner;
       owner->klass->registerSubPtr(owner, p);
-    }
-  }
-}
-
-void Collector::unregisterPtr(PtrBase* p) {
-  PtrBase* pointer;
-  {
-    unique_lock lk{mutex, try_to_lock};
-
-    if (p == pointers.back()) {
-      pointers.pop_back();
-      return;
-    } else {
-      swap(pointers[p->index], pointers.back());
-      pointer = pointers[p->index];
-      pointers.pop_back();
-      pointer->index = p->index;
-    }
-  }
-  if (!pointer->meta)
-    return;
-  shared_lock lk{mutex, try_to_lock};
-  if (state == State::RootMarking) {
-    if (p->index < nextRootMarking) {
-      tryMarkRoot(pointer);
-    }
-  }
-}
-
-void Collector::tryMarkRoot(PtrBase* p) {
-  if (p->isRoot == 1) {
-    if (p->meta->color == ObjMeta::Color::White) {
-      p->meta->color = ObjMeta::Color::Gray;
-
-      unique_lock lk{mutex, try_to_lock};
-      grayObjs.push_back(p->meta);
     }
   }
 }
@@ -227,31 +176,13 @@ void Collector::tryMarkRoot(PtrBase* p) {
 void Collector::onPointerChanged(PtrBase* p) {
   if (!p->meta)
     return;
-
-  shared_lock lk{mutex, try_to_lock};
-  switch (state) {
-    case State::RootMarking:
-      if (p->index < nextRootMarking)
-        tryMarkRoot(p);
-      break;
-    case State::LeafMarking:
-      tryMarkRoot(p);
-      break;
-    case State::Sweeping:
-      if (p->meta->color == ObjMeta::Color::White) {
-        // if (*p->meta < **nextSweeping) {
-        // already passed sweeping stage.
-        //} else {
-        // delay to the next collection.
-        p->meta->color = ObjMeta::Color::Black;
-        //}
-      }
-      break;
+  p->meta->isRoot = p->isRoot();
+  if (oldGen.find(p->owner) != oldGen.end()) {
+    intergenerationalObjs.insert(p->meta);
   }
 }
 
 ObjMeta* Collector::findCreatingObj(PtrBase* p) {
-  shared_lock lk{mutex, try_to_lock};
   // owner may not be the current one(e.g. constructor recursed)
   for (auto i = creatingObjs.rbegin(); i != creatingObjs.rend(); ++i) {
     if ((*i)->containsPtr((char*)p))
@@ -261,103 +192,104 @@ ObjMeta* Collector::findCreatingObj(PtrBase* p) {
 }
 
 ObjMeta* Collector::globalFindOwnerMeta(void* obj) {
-  shared_lock lk{mutex, try_to_lock};
   auto* meta = (ObjMeta*)((char*)obj - sizeof(ObjMeta));
   return meta;
 }
 
-void Collector::collect(int stepCnt) {
-  unique_lock lk{mutex};
+void Collector::mark(ObjMeta* meta) {
+  if (meta->color == ObjMeta::Color::White) {
+    meta->color = ObjMeta::Color::Black;
 
-  freeObjCntOfPrevGc = 0;
-
-  switch (state) {
-  _RootMarking:
-  case State::RootMarking:
-    for (; nextRootMarking < pointers.size() && stepCnt-- > 0;
-         nextRootMarking++) {
-      auto p = pointers[nextRootMarking];
-      auto meta = p->meta;
-      if (!meta)
-        continue;
-      // for containers
-      auto it = meta->klass->enumPtrs(meta);
-      for (; auto* ptr = it->getNext(); stepCnt--) {
-        ptr->isRoot = 0;
-      }
-      delete it;
-      tryMarkRoot(p);
-    }
-    if (nextRootMarking >= pointers.size()) {
-      state = State::LeafMarking;
-      nextRootMarking = 0;
-      goto _ChildMarking;
-    }
-    break;
-
-  _ChildMarking:
-  case State::LeafMarking:
-    while (grayObjs.size() && stepCnt-- > 0) {
-      ObjMeta* o = grayObjs.back();
-      grayObjs.pop_back();
-      o->color = ObjMeta::Color::Black;
-
-      auto cls = o->klass;
-      auto it = cls->enumPtrs(o);
-      for (; auto* ptr = it->getNext(); stepCnt--) {
-        auto* meta = ptr->meta;
-        if (!meta)
-          continue;
+    for (auto it = meta->klass->enumPtrs(meta); auto* ptr = it->getNext();) {
+      if (auto* meta = ptr->meta) {
         if (meta->color == ObjMeta::Color::White) {
-          meta->color = ObjMeta::Color::Gray;
-          grayObjs.push_back(meta);
+          meta->color = ObjMeta::Color::Black;
         }
       }
-      delete it;
     }
-    if (!grayObjs.size()) {
-      state = State::Sweeping;
-      nextSweeping = metaSet.begin();
-      goto _Sweeping;
-    }
-    break;
+  }
+}
 
-  _Sweeping:
-  case State::Sweeping:
-    for (; nextSweeping != metaSet.end() && stepCnt-- > 0;) {
-      ObjMeta* meta = *nextSweeping;
-      if (meta->color == ObjMeta::Color::White) {
-        nextSweeping = metaSet.erase(nextSweeping);
-        delete meta;
-        freeObjCntOfPrevGc++;
-        continue;
-      }
+void Collector::collectNewGen() {
+  for (auto meta : newGen) {
+    if (meta->isRoot) {
+      mark(meta);
+    }
+  }
+  for (auto meta : intergenerationalObjs) {
+    mark(meta);
+  }
+
+  freeObjCntOfPrevGc = 0;
+  sweep(newGen, true);
+}
+
+int Collector::sweep(MetaSet& gen, bool allowPromote) {
+  int freeSizeBytes = 0;
+  for (auto it = gen.begin(); it != gen.end();) {
+    auto* meta = *it;
+    if (meta->color == ObjMeta::Color::White) {
+      freeSizeBytes += meta->sizeInBytes();
+      delete meta;
+      freeObjCntOfPrevGc++;
+      it = gen.erase(it);
+
+    } else {
       meta->color = ObjMeta::Color::White;
-      ++nextSweeping;
+
+      if (allowPromote && meta->scanCountInNewGen++ > 3) {
+        promote(meta);
+        meta->scanCountInNewGen = 0;
+        it = newGen.erase(it);
+      } else
+        ++it;
     }
-    if (nextSweeping == metaSet.end()) {
-      state = State::RootMarking;
-      if (metaSet.size())
-        goto _RootMarking;
+  }
+  return freeSizeBytes;
+}
+
+void Collector::promote(ObjMeta* meta) {
+  oldGen.insert(meta);
+  intergenerationalObjs.insert(meta);
+  oldGenSize += meta->sizeInBytes();
+}
+
+void Collector::fullCollect() {
+  for (auto meta : newGen) {
+    if (meta->isRoot) {
+      mark(meta);
     }
-    break;
+  }
+  for (auto* meta : oldGen) {
+    if (meta->isRoot) {
+      mark(meta);
+    }
+  }
+  freeObjCntOfPrevGc = 0;
+  sweep(newGen, false);
+  oldGenSize -= sweep(oldGen, false);
+}
+
+void Collector::collect() {
+  collectNewGen();
+  if (oldGenSize > sizeOfOldGenToFullCollect) {
+    fullCollect();
   }
 }
 
 void Collector::dumpStats() {
-  shared_lock lk{mutex, try_to_lock};
-
   printf("========= [gc] ========\n");
-  printf("[total pointers ] %3d\n", (unsigned)pointers.size());
-  printf("[total meta     ] %3d\n", (unsigned)metaSet.size());
-  printf("[total gray meta] %3d\n", (unsigned)grayObjs.size());
+  printf("[newGen meta     ] %3d\n", (unsigned)newGen.size());
+  printf("[oldGen meta     ] %3d\n", (unsigned)oldGen.size());
   auto liveCnt = 0;
-  for (auto i : metaSet)
+  for (auto i : newGen)
+    if (i->arrayLength)
+      liveCnt++;
+  for (auto i : oldGen)
     if (i->arrayLength)
       liveCnt++;
   printf("[live objects   ] %3d\n", liveCnt);
   printf("[last freed objs] %3d\n", freeObjCntOfPrevGc);
-  printf("[collector state] %s\n", StateStr[(int)state]);
   printf("=======================\n");
 }
 

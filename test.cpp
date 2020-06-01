@@ -167,7 +167,7 @@ void testSet() {
     auto o = gc_new<rc>();
     t->insert(o);
   }
-  gc_collect(1);
+  gc_collect();
 
   auto t = gc_new_set<rc>();
   gc_delete(t);
@@ -307,7 +307,7 @@ void testCollection() {
       s->child = s;
     }
     gc_dumpStats();
-    gc_collect(cnt * 2);
+    gc_collect();
     gc_dumpStats();
   }
 }
@@ -345,7 +345,7 @@ int main() {
   testPrimaryImplicitCtor();
   testSet();
   testEmpty();
-  testPointerCast();
+  // testPointerCast();
   testMoveCtor();
   testCirc();
   testArray();
