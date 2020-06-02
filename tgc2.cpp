@@ -11,13 +11,9 @@ int ClassMeta::isCreatingObj = 0;
 
 Collector* Collector::inst = nullptr;
 
-char ClassMeta::buf[255];
+char IPtrEnumerator::buf[255];
 
 //////////////////////////////////////////////////////////////////////////
-
-char* ObjMeta::objPtr() const {
-  return (char*)this + sizeof(ObjMeta);
-}
 
 void ObjMeta::destroy() {
   if (!arrayLength)
@@ -42,7 +38,7 @@ bool ObjMeta::containsPtr(char* p) {
 
 //////////////////////////////////////////////////////////////////////////
 
-const PtrBase* ObjPtrEnumerator::getNext() {
+PtrBase* ObjPtrEnumerator::getNext() {
   if (auto* subPtrs = meta->klass->subPtrOffsets) {
     if (arrayElemIdx < meta->arrayLength && subPtrIdx < subPtrs->size()) {
       auto* klass = meta->klass;
@@ -60,59 +56,65 @@ const PtrBase* ObjPtrEnumerator::getNext() {
 
 PtrBase::PtrBase() {
   auto* c = Collector::inst ? Collector::inst : Collector::get();
-  c->registerToOwnerClass(this);
+  c->tryRegisterToClass(this);
 }
 
 PtrBase::PtrBase(void* obj) {
   auto* c = Collector::inst ? Collector::inst : Collector::get();
   meta = c->globalFindOwnerMeta(obj);
-  c->registerToOwnerClass(this);
+  c->tryRegisterToClass(this);
 }
 
 PtrBase::~PtrBase() {
-  if (isRoot()) {
-    if (meta && meta->rootRefs > 0)
-      meta->rootRefs--;
+  auto* c = Collector::inst;
+
+  if (c->delayIntergenerationalPtrs.find(this) ==
+      c->delayIntergenerationalPtrs.end()) {
+    if (isRoot() && meta) {
+      if (meta->rootRefs > 0)
+        meta->rootRefs--;
+    }
   }
+
+  Collector::inst->intergenerationalPtrs.erase(this);
+  Collector::inst->delayIntergenerationalPtrs.erase(this);
 }
 
-void PtrBase::onPtrChanged() {
-  Collector::inst->onPointerChanged(this);
+void PtrBase::writeBarriers() {
+  if (this->meta)
+    Collector::inst->delayIntergenerationalPtrs.insert(this);
 }
 
 //////////////////////////////////////////////////////////////////////////
 
 ObjMeta* ClassMeta::newMeta(size_t cnt) {
+  assert(memHandler && "should not be called in global scope (before main)");
+
   auto* c = Collector::inst ? Collector::inst : Collector::get();
+
   if (c->newGen.size() % c->newGenSizeForCollect == 0)
     c->collect();
 
   ObjMeta* meta = nullptr;
   try {
-    assert(memHandler && "should not be called in global scope (before main)");
     if (memHandler) {
       isCreatingObj++;
       meta = (ObjMeta*)memHandler(this, MemRequest::Alloc,
                                   reinterpret_cast<void*>(cnt));
-
       // Allow using gc_from(this) in the constructor of the creating object.
       c->addMeta(meta);
     }
     return meta;
   } catch (std::bad_alloc&) {
-    memHandler(this, MemRequest::Dealloc, meta);
+    if (meta)
+      memHandler(this, MemRequest::Dealloc, meta);
     throw;
   }
 }
 
 void ClassMeta::endNewMeta(ObjMeta* meta, bool failed) {
   auto* c = Collector::inst;
-
   isCreatingObj--;
-  if (!failed) {
-    state = ClassMeta::State::Registered;
-  }
-
   {
     c->creatingObjs.remove(meta);
     if (failed) {
@@ -124,17 +126,11 @@ void ClassMeta::endNewMeta(ObjMeta* meta, bool failed) {
 
 void ClassMeta::registerSubPtr(ObjMeta* owner, PtrBase* p) {
   auto offset = (OffsetType)((char*)p - owner->objPtr());
-  {
-    if (state == ClassMeta::State::Registered)
-      return;
-    // constructor recursed.
-    if (subPtrOffsets && offset <= subPtrOffsets->back())
-      return;
-  }
-
-  if (!subPtrOffsets)
+  if (!subPtrOffsets) {
     subPtrOffsets = new vector<OffsetType>();
-  subPtrOffsets->push_back(offset);
+    subPtrOffsets->push_back(offset);
+  } else if (offset > subPtrOffsets->back())
+    subPtrOffsets->push_back(offset);
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -142,7 +138,9 @@ void ClassMeta::registerSubPtr(ObjMeta* owner, PtrBase* p) {
 Collector::Collector() {
   newGen.reserve(1024 * 10);
   oldGen.reserve(1024 * 10);
-  intergenerationalObjs.reserve(1024 * 10);
+  temp.reserve(1024 * 10);
+  intergenerationalPtrs.reserve(1024 * 10);
+  delayIntergenerationalPtrs.reserve(1024 * 10);
 }
 
 Collector::~Collector() {
@@ -171,32 +169,27 @@ void Collector::addMeta(ObjMeta* meta) {
   creatingObjs.push_back(meta);
 }
 
-void Collector::registerToOwnerClass(PtrBase* p) {
+void Collector::tryRegisterToClass(PtrBase* p) {
   if (ClassMeta::isCreatingObj > 0) {
-    if (auto* owner = findCreatingObj(p)) {
-      p->owner = owner;
-      owner->klass->registerSubPtr(owner, p);
+    // owner may not be the current one(e.g. constructor recursed)
+    for (auto i = creatingObjs.rbegin(); i != creatingObjs.rend(); ++i) {
+      auto* owner = *i;
+      if (owner->containsPtr((char*)p)) {
+        owner->klass->registerSubPtr(owner, p);
+      }
     }
   }
 }
 
-void Collector::onPointerChanged(PtrBase* p) {
-  if (!p->meta)
-    return;
-  if (p->isRoot())
-    p->meta->rootRefs++;
-  else if (oldGen.find(p->owner) != oldGen.end()) {
-    intergenerationalObjs.insert(p->owner);
+void Collector::handleDelayIntergenerationalPtrs() {
+  for (auto* p : delayIntergenerationalPtrs) {
+    if (p->isRoot())
+      p->meta->rootRefs++;
+    else if (oldGen.find(p->owner) != oldGen.end()) {
+      intergenerationalPtrs.insert(p);
+    }
   }
-}
-
-ObjMeta* Collector::findCreatingObj(PtrBase* p) {
-  // owner may not be the current one(e.g. constructor recursed)
-  for (auto i = creatingObjs.rbegin(); i != creatingObjs.rend(); ++i) {
-    if ((*i)->containsPtr((char*)p))
-      return *i;
-  }
-  return nullptr;
+  delayIntergenerationalPtrs.clear();
 }
 
 ObjMeta* Collector::globalFindOwnerMeta(void* obj) {
@@ -205,43 +198,69 @@ ObjMeta* Collector::globalFindOwnerMeta(void* obj) {
 }
 
 void Collector::mark(ObjMeta* meta) {
-  if (meta->color == ObjMeta::Color::White) {
-    meta->color = ObjMeta::Color::Black;
-    markChildren(meta);
+  auto doMark = [this](ObjMeta* meta) {
+    if (meta->color == ObjMeta::Color::White) {
+      meta->color = ObjMeta::Color::Black;
+      auto* ptrIt = meta->klass->enumPtrs(meta);
+      for (; auto* child = ptrIt->getNext();) {
+        if (auto* m = child->meta) {
+          temp.push_back(m);
+        }
+      }
+      delete ptrIt;
+    }
+  };
+
+  doMark(meta);
+  while (temp.size()) {
+    auto* m = temp.back();
+    temp.pop_back();
+    doMark(m);
   }
 }
 
-void Collector::markChildren(ObjMeta* meta) {
-  for (auto* it = meta->klass->enumPtrs(meta); auto* child = it->getNext();) {
-    if (auto* m = child->meta) {
-      m->rootRefs = 0;  // for container elements.
-      m->color = ObjMeta::Color::Black;
+// Unified way for objects and containers.
+// Need to fix for every pass as containers can be modified at any time.
+void Collector::fixOwner(ObjMeta* meta) {
+  auto doFix = [&](ObjMeta* meta) {
+    auto* it = meta->klass->enumPtrs(meta);
+    for (; auto* ptr = it->getNext();) {
+      ptr->owner = meta;
+      if (ptr->meta) {
+        ptr->meta->rootRefs = 0;
+        temp.push_back(ptr->meta);
+      }
     }
+    delete it;
+  };
+  doFix(meta);
+  while (temp.size()) {
+    auto* m = temp.back();
+    temp.pop_back();
+    doFix(m);
   }
 }
 
 void Collector::collectNewGen() {
-  for (auto meta : newGen) {
-    // for containers
-    for (auto* it = meta->klass->enumPtrs(meta); auto* ptr = it->getNext();) {
-      if (auto* e = ptr->meta) {
-        e->rootRefs = 0;
-      }
-    }
+  for (auto meta : newGen)
+    fixOwner(meta);
 
+  handleDelayIntergenerationalPtrs();
+
+  for (auto meta : newGen) {
     if (meta->isRoot()) {
       mark(meta);
     }
   }
 
-  for (auto meta : intergenerationalObjs) {
-    markChildren(meta);
+  for (auto ptr : intergenerationalPtrs) {
+    mark(ptr->meta);
   }
 
-  sweep(newGen, false);
+  sweep(newGen);
 }
 
-int Collector::sweep(MetaSet& gen, bool full) {
+int Collector::sweep(MetaSet& gen) {
   int freeSizeBytes = 0;
 
   for (auto it = gen.begin(); it != gen.end();) {
@@ -250,18 +269,13 @@ int Collector::sweep(MetaSet& gen, bool full) {
     if (meta->color == ObjMeta::Color::White) {
       freeSizeBytes += meta->sizeInBytes();
       freeObjCntOfPrevGc++;
-
       delete meta;
-      if (full)
-        intergenerationalObjs.erase(meta);
-
       it = gen.erase(it);
     } else {
       meta->color = ObjMeta::Color::White;
 
       if (!full && ++meta->scanCountInNewGen >= oldGenScanCount) {
         meta->scanCountInNewGen = 0;
-
         promote(meta);
         it = newGen.erase(it);
       } else
@@ -273,11 +287,25 @@ int Collector::sweep(MetaSet& gen, bool full) {
 
 void Collector::promote(ObjMeta* meta) {
   oldGen.insert(meta);
-  intergenerationalObjs.insert(meta);
+  auto it = meta->klass->enumPtrs(meta);
+  for (; auto* p = it->getNext();) {
+    if (p->meta)
+      intergenerationalPtrs.insert(p);
+  }
+  delete it;
   oldGenSize += meta->sizeInBytes();
 }
 
 void Collector::fullCollect() {
+  full = true;
+
+  for (auto meta : newGen)
+    fixOwner(meta);
+  for (auto* meta : oldGen)
+    fixOwner(meta);
+
+  handleDelayIntergenerationalPtrs();
+
   for (auto meta : newGen) {
     if (meta->isRoot()) {
       mark(meta);
@@ -289,15 +317,17 @@ void Collector::fullCollect() {
     }
   }
 
-  sweep(newGen, true);
-  oldGenSize -= sweep(oldGen, true);
+  sweep(newGen);
+  oldGenSize -= sweep(oldGen);
+  full = false;
 }
 
 void Collector::collect() {
   freeObjCntOfPrevGc = 0;
-  collectNewGen();
   if (oldGenSize > sizeOfOldGenToFullCollect) {
     fullCollect();
+  } else {
+    collectNewGen();
   }
 }
 

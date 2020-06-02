@@ -64,8 +64,8 @@ class ObjMeta {
   ClassMeta* klass = nullptr;
   size_t arrayLength = 0;
   unsigned short rootRefs = 0;
-  Color color = Color::White;
-  unsigned char scanCountInNewGen = 0;
+  Color color : 2;
+  unsigned char scanCountInNewGen : 3;
 
   ObjMeta(ClassMeta* c, char* o, size_t n)
       : klass(c), arrayLength(n), scanCountInNewGen(0), color(Color::White) {}
@@ -76,7 +76,7 @@ class ObjMeta {
   void operator delete(void* c);
   bool isRoot() const { return rootRefs > 0; }
   bool containsPtr(char* p);
-  char* objPtr() const;
+  char* objPtr() const { return (char*)this + sizeof(ObjMeta); }
   void destroy();
   size_t sizeInBytes() const;
 };
@@ -89,7 +89,11 @@ static_assert(sizeof(ObjMeta) <= sizeof(void*) * 3,
 class IPtrEnumerator {
  public:
   virtual ~IPtrEnumerator() {}
-  virtual const PtrBase* getNext() = 0;
+  virtual PtrBase* getNext() = 0;
+
+  static char buf[255];
+  void* operator new(size_t) { return buf; }
+  void operator delete(void*) {}
 };
 
 class ObjPtrEnumerator : public IPtrEnumerator {
@@ -98,7 +102,7 @@ class ObjPtrEnumerator : public IPtrEnumerator {
 
  public:
   ObjPtrEnumerator(ObjMeta* m) : meta(m) {}
-  const PtrBase* getNext() override;
+  PtrBase* getNext() override;
 };
 
 template <typename T>
@@ -110,7 +114,6 @@ struct PtrEnumerator : ObjPtrEnumerator {
 
 class ClassMeta {
  public:
-  enum class State : unsigned char { Unregistered, Registered };
   enum class MemRequest { Alloc, Dctor, Dealloc, NewPtrEnumerator };
   using MemHandler = void* (*)(ClassMeta* cls, MemRequest r, void* param);
   using OffsetType = unsigned short;
@@ -118,11 +121,9 @@ class ClassMeta {
 
   MemHandler memHandler = nullptr;
   vector<OffsetType>* subPtrOffsets = nullptr;
-  State state = State::Unregistered;
   SizeType size = 0;
 
   static int isCreatingObj;
-  static ClassMeta dummy;
 
   ClassMeta() {}
   ClassMeta(MemHandler h, SizeType sz) : memHandler(h), size(sz) {}
@@ -141,8 +142,6 @@ class ClassMeta {
   }
 
  private:
-  static char buf[255];
-
   template <typename T>
   struct Holder {
     static void* MemHandler(ClassMeta* cls, MemRequest r, void* param) {
@@ -165,7 +164,7 @@ class ClassMeta {
         } break;
         case MemRequest::NewPtrEnumerator: {
           auto meta = (ObjMeta*)param;
-          return new (buf) PtrEnumerator<T>(meta);
+          return new PtrEnumerator<T>(meta);
         } break;
       }
       return nullptr;
@@ -197,7 +196,7 @@ class PtrBase {
   PtrBase(void* obj);
   ~PtrBase();
 
-  void onPtrChanged();
+  void writeBarriers();
   bool isRoot() const { return !owner; }
 
  protected:
@@ -218,7 +217,7 @@ class GcPtr : public PtrBase {
   // Constructors
 
   GcPtr() {}
-  GcPtr(ObjMeta* meta) { reset((T*)meta->objPtr(), meta); }
+  GcPtr(ObjMeta* m) { reset((T*)m->objPtr(), m); }
   explicit GcPtr(T* obj) : PtrBase(obj), p(obj) {}
   template <typename U>
   GcPtr(const GcPtr<U>& r) {
@@ -243,8 +242,7 @@ class GcPtr : public PtrBase {
   }
   GcPtr& operator=(GcPtr&& r) {
     reset(r.p, r.meta);
-    r.meta = 0;
-    r.p = 0;
+    r = nullptr;
     return *this;
   }
   T* operator->() const { return p; }
@@ -265,7 +263,7 @@ class GcPtr : public PtrBase {
   void reset(T* o, ObjMeta* n) {
     p = o;
     meta = n;
-    onPtrChanged();
+    writeBarriers();
   }
 
  protected:
@@ -308,14 +306,16 @@ class Collector {
 
   using MetaSet = unordered_set<ObjMeta*>;
 
-  MetaSet intergenerationalObjs;
+  unordered_set<PtrBase*> intergenerationalPtrs, delayIntergenerationalPtrs;
   MetaSet newGen, oldGen;
+  vector<ObjMeta*> temp;
   list<ObjMeta*> creatingObjs;
   int freeObjCntOfPrevGc;
   int oldGenSize = 0;
+  bool full = false;
 
   int sizeOfOldGenToFullCollect = 1024 * 1024 * 1;
-  int oldGenScanCount = 3;
+  int oldGenScanCount = 2;
   int newGenSizeForCollect = 256;
 
   static Collector* inst;
@@ -330,15 +330,14 @@ class Collector {
   Collector();
   ~Collector();
 
-  int sweep(MetaSet& gen, bool full);
+  int sweep(MetaSet& gen);
   void promote(ObjMeta* meta);
   ObjMeta* globalFindOwnerMeta(void* obj);
-  void registerToOwnerClass(PtrBase* p);
-  void onPointerChanged(PtrBase* p);
+  void tryRegisterToClass(PtrBase* p);
+  void handleDelayIntergenerationalPtrs();
   void mark(ObjMeta* meta);
-  void markChildren(ObjMeta* meta);
+  void fixOwner(ObjMeta* meta);
   void collectNewGen();
-  ObjMeta* findCreatingObj(PtrBase* p);
   void addMeta(ObjMeta* meta);
 };
 
@@ -488,7 +487,7 @@ template <typename T>
 struct PtrEnumerator<vector<gc<T>>> : ContainerPtrEnumerator<vector<gc<T>>> {
   using ContainerPtrEnumerator<vector<gc<T>>>::ContainerPtrEnumerator;
 
-  const PtrBase* getNext() override {
+  PtrBase* getNext() override {
     return this->hasNext() ? &*this->it++ : nullptr;
   }
 };
