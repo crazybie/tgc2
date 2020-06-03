@@ -22,10 +22,6 @@ void ObjMeta::destroy() {
   arrayLength = 0;
 }
 
-size_t ObjMeta::sizeInBytes() const {
-  return arrayLength * klass->size;
-}
-
 void ObjMeta::operator delete(void* p) {
   auto* m = (ObjMeta*)p;
   m->klass->memHandler(m->klass, ClassMeta::MemRequest::Dealloc, m);
@@ -92,7 +88,7 @@ ObjMeta* ClassMeta::newMeta(size_t cnt) {
 
   auto* c = Collector::inst ? Collector::inst : Collector::get();
 
-  if (c->newGen.size() % c->newGenSizeForCollect == 0)
+  if (c->allocCounter++ % c->newGenSizeForCollect == 0)
     c->collect();
 
   ObjMeta* meta = nullptr;
@@ -198,9 +194,10 @@ ObjMeta* Collector::globalFindOwnerMeta(void* obj) {
 }
 
 void Collector::mark(ObjMeta* meta) {
-  auto doMark = [this](ObjMeta* meta) {
+  auto doMark = [&](ObjMeta* meta) {
     if (meta->color == ObjMeta::Color::White) {
       meta->color = ObjMeta::Color::Black;
+
       auto* ptrIt = meta->klass->enumPtrs(meta);
       for (; auto* child = ptrIt->getNext();) {
         if (auto* m = child->meta) {
@@ -223,6 +220,9 @@ void Collector::mark(ObjMeta* meta) {
 // Need to fix for every pass as containers can be modified at any time.
 void Collector::fixOwner(ObjMeta* meta) {
   auto doFix = [&](ObjMeta* meta) {
+    // sweep function cannot reset color of intergenerational objects.
+    meta->color = ObjMeta::Color::White;
+
     auto* it = meta->klass->enumPtrs(meta);
     for (; auto* ptr = it->getNext();) {
       ptr->owner = meta;
@@ -233,6 +233,7 @@ void Collector::fixOwner(ObjMeta* meta) {
     }
     delete it;
   };
+
   doFix(meta);
   while (temp.size()) {
     auto* m = temp.back();
@@ -242,6 +243,8 @@ void Collector::fixOwner(ObjMeta* meta) {
 }
 
 void Collector::collectNewGen() {
+  freeObjCntOfPrevGc = 0;
+
   for (auto meta : newGen)
     fixOwner(meta);
 
@@ -260,20 +263,15 @@ void Collector::collectNewGen() {
   sweep(newGen);
 }
 
-int Collector::sweep(MetaSet& gen) {
-  int freeSizeBytes = 0;
-
+void Collector::sweep(MetaSet& gen) {
   for (auto it = gen.begin(); it != gen.end();) {
     auto* meta = *it;
 
     if (meta->color == ObjMeta::Color::White) {
-      freeSizeBytes += meta->sizeInBytes();
       freeObjCntOfPrevGc++;
       delete meta;
       it = gen.erase(it);
     } else {
-      meta->color = ObjMeta::Color::White;
-
       if (!full && ++meta->scanCountInNewGen >= oldGenScanCount) {
         meta->scanCountInNewGen = 0;
         promote(meta);
@@ -282,7 +280,10 @@ int Collector::sweep(MetaSet& gen) {
         ++it;
     }
   }
-  return freeSizeBytes;
+
+  if (trace)
+    printf("sweep %s, free cnt:%d\n", &gen == &oldGen ? "old" : "new",
+           freeObjCntOfPrevGc);
 }
 
 void Collector::promote(ObjMeta* meta) {
@@ -293,10 +294,10 @@ void Collector::promote(ObjMeta* meta) {
       intergenerationalPtrs.insert(p);
   }
   delete it;
-  oldGenSize += meta->sizeInBytes();
 }
 
 void Collector::fullCollect() {
+  freeObjCntOfPrevGc = 0;
   full = true;
 
   for (auto meta : newGen)
@@ -318,13 +319,12 @@ void Collector::fullCollect() {
   }
 
   sweep(newGen);
-  oldGenSize -= sweep(oldGen);
+  sweep(oldGen);
   full = false;
 }
 
 void Collector::collect() {
-  freeObjCntOfPrevGc = 0;
-  if (oldGenSize > sizeOfOldGenToFullCollect) {
+  if (oldGen.size() > sizeOfOldGenToFullCollect) {
     fullCollect();
   } else {
     collectNewGen();

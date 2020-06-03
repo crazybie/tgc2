@@ -64,8 +64,8 @@ class ObjMeta {
   ClassMeta* klass = nullptr;
   size_t arrayLength = 0;
   unsigned short rootRefs = 0;
-  Color color : 2;
-  unsigned char scanCountInNewGen : 3;
+  Color color;
+  unsigned char scanCountInNewGen;
 
   ObjMeta(ClassMeta* c, char* o, size_t n)
       : klass(c), arrayLength(n), scanCountInNewGen(0), color(Color::White) {}
@@ -78,7 +78,6 @@ class ObjMeta {
   bool containsPtr(char* p);
   char* objPtr() const { return (char*)this + sizeof(ObjMeta); }
   void destroy();
-  size_t sizeInBytes() const;
 };
 
 static_assert(sizeof(ObjMeta) <= sizeof(void*) * 3,
@@ -310,13 +309,14 @@ class Collector {
   MetaSet newGen, oldGen;
   vector<ObjMeta*> temp;
   list<ObjMeta*> creatingObjs;
-  int freeObjCntOfPrevGc;
-  int oldGenSize = 0;
-  bool full = false;
 
-  int sizeOfOldGenToFullCollect = 1024 * 1024 * 1;
+  int freeObjCntOfPrevGc;
+  int allocCounter = 0;
+  size_t sizeOfOldGenToFullCollect = 20 * 1024;
   int oldGenScanCount = 2;
-  int newGenSizeForCollect = 256;
+  int newGenSizeForCollect = 512;
+  bool trace = false;
+  bool full = false;
 
   static Collector* inst;
 
@@ -330,7 +330,7 @@ class Collector {
   Collector();
   ~Collector();
 
-  int sweep(MetaSet& gen);
+  void sweep(MetaSet& gen);
   void promote(ObjMeta* meta);
   ObjMeta* globalFindOwnerMeta(void* obj);
   void tryRegisterToClass(PtrBase* p);
