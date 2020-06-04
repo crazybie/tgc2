@@ -1,5 +1,7 @@
 #include "tgc2.h"
 
+#include <algorithm>
+
 #ifdef _WIN32
 #include <crtdbg.h>
 #endif
@@ -63,20 +65,10 @@ PtrBase::PtrBase(void* obj) {
 
 PtrBase::~PtrBase() {
   auto* c = Collector::inst;
-
-  if (c->delayIntergenerationalPtrs.find(this) ==
-      c->delayIntergenerationalPtrs.end()) {
-    if (isRoot() && meta) {
-      if (meta->rootRefs > 0)
-        meta->rootRefs--;
-    }
-  }
-
-  Collector::inst->intergenerationalPtrs.erase(this);
-  Collector::inst->delayIntergenerationalPtrs.erase(this);
+  c->unrefs.emplace_back(this, meta);
 }
 
-void PtrBase::writeBarriers() {
+void PtrBase::writeBarrier() {
   if (this->meta)
     Collector::inst->delayIntergenerationalPtrs.insert(this);
 }
@@ -88,7 +80,7 @@ ObjMeta* ClassMeta::newMeta(size_t cnt) {
 
   auto* c = Collector::inst ? Collector::inst : Collector::get();
 
-  if (c->allocCounter++ % c->newGenSizeForCollect == 0)
+  if (c->allocCounter++ % c->newGenObjCntToGc == 0)
     c->collect();
 
   ObjMeta* meta = nullptr;
@@ -112,7 +104,9 @@ void ClassMeta::endNewMeta(ObjMeta* meta, bool failed) {
   auto* c = Collector::inst;
   isCreatingObj--;
   {
-    c->creatingObjs.remove(meta);
+    c->creatingObjs.erase(
+        remove(c->creatingObjs.begin(), c->creatingObjs.end(), meta),
+        c->creatingObjs.end());
     if (failed) {
       c->newGen.erase(meta);
       memHandler(this, MemRequest::Dealloc, meta);
@@ -132,11 +126,7 @@ void ClassMeta::registerSubPtr(ObjMeta* owner, PtrBase* p) {
 //////////////////////////////////////////////////////////////////////////
 
 Collector::Collector() {
-  newGen.reserve(1024 * 10);
-  oldGen.reserve(1024 * 10);
-  temp.reserve(1024 * 10);
-  intergenerationalPtrs.reserve(1024 * 10);
-  delayIntergenerationalPtrs.reserve(1024 * 10);
+  reserve(1024 * 10);
 }
 
 Collector::~Collector() {
@@ -146,6 +136,15 @@ Collector::~Collector() {
   for (auto i : oldGen) {
     delete i;
   }
+}
+
+void Collector::reserve(int sz) {
+  newGen.reserve(sz);
+  oldGen.reserve(sz * 10);
+  unrefs.reserve(sz * 10);
+  temp.reserve(sz);
+  intergenerationalPtrs.reserve(1024 * 10);
+  delayIntergenerationalPtrs.reserve(1024 * 10);
 }
 
 Collector* Collector::get() {
@@ -177,10 +176,21 @@ void Collector::tryRegisterToClass(PtrBase* p) {
   }
 }
 
+void Collector::handleUnrefs() {
+  for (auto& [ptr, meta] : unrefs) {
+    intergenerationalPtrs.erase(ptr);
+    delayIntergenerationalPtrs.erase(ptr);
+
+    if (meta && meta->refCntFromRoot > 0)
+      meta->refCntFromRoot--;
+  }
+  unrefs.clear();
+}
+
 void Collector::handleDelayIntergenerationalPtrs() {
   for (auto* p : delayIntergenerationalPtrs) {
     if (p->isRoot())
-      p->meta->rootRefs++;
+      p->meta->refCntFromRoot++;
     else if (oldGen.find(p->owner) != oldGen.end()) {
       intergenerationalPtrs.insert(p);
     }
@@ -227,7 +237,7 @@ void Collector::fixOwner(ObjMeta* meta) {
     for (; auto* ptr = it->getNext();) {
       ptr->owner = meta;
       if (ptr->meta) {
-        ptr->meta->rootRefs = 0;
+        ptr->meta->refCntFromRoot = 0;
         temp.push_back(ptr->meta);
       }
     }
@@ -248,6 +258,7 @@ void Collector::collectNewGen() {
   for (auto meta : newGen)
     fixOwner(meta);
 
+  handleUnrefs();
   handleDelayIntergenerationalPtrs();
 
   for (auto meta : newGen) {
@@ -272,7 +283,7 @@ void Collector::sweep(MetaSet& gen) {
       delete meta;
       it = gen.erase(it);
     } else {
-      if (!full && ++meta->scanCountInNewGen >= oldGenScanCount) {
+      if (!full && ++meta->scanCountInNewGen >= scanCountToOldGen) {
         meta->scanCountInNewGen = 0;
         promote(meta);
         it = newGen.erase(it);
@@ -305,6 +316,7 @@ void Collector::fullCollect() {
   for (auto* meta : oldGen)
     fixOwner(meta);
 
+  handleUnrefs();
   handleDelayIntergenerationalPtrs();
 
   for (auto meta : newGen) {
@@ -324,7 +336,7 @@ void Collector::fullCollect() {
 }
 
 void Collector::collect() {
-  if (oldGen.size() > sizeOfOldGenToFullCollect) {
+  if (oldGen.size() > oldGenObjCntToFullGc) {
     fullCollect();
   } else {
     collectNewGen();

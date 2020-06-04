@@ -63,7 +63,7 @@ class ObjMeta {
 
   ClassMeta* klass = nullptr;
   size_t arrayLength = 0;
-  unsigned short rootRefs = 0;
+  unsigned short refCntFromRoot = 0;
   Color color;
   unsigned char scanCountInNewGen;
 
@@ -74,7 +74,7 @@ class ObjMeta {
       destroy();
   }
   void operator delete(void* c);
-  bool isRoot() const { return rootRefs > 0; }
+  bool isRoot() const { return refCntFromRoot > 0; }
   bool containsPtr(char* p);
   char* objPtr() const { return (char*)this + sizeof(ObjMeta); }
   void destroy();
@@ -116,16 +116,14 @@ class ClassMeta {
   enum class MemRequest { Alloc, Dctor, Dealloc, NewPtrEnumerator };
   using MemHandler = void* (*)(ClassMeta* cls, MemRequest r, void* param);
   using OffsetType = unsigned short;
-  using SizeType = unsigned short;
 
   MemHandler memHandler = nullptr;
   vector<OffsetType>* subPtrOffsets = nullptr;
-  SizeType size = 0;
+  unsigned short size = 0;
 
   static int isCreatingObj;
 
-  ClassMeta() {}
-  ClassMeta(MemHandler h, SizeType sz) : memHandler(h), size(sz) {}
+  ClassMeta(MemHandler h, unsigned short sz) : memHandler(h), size(sz) {}
   ~ClassMeta() { delete subPtrOffsets; }
 
   ObjMeta* newMeta(size_t objCnt);
@@ -176,10 +174,8 @@ class ClassMeta {
 template <typename T>
 ClassMeta ClassMeta::Holder<T>::inst{MemHandler, sizeof(T)};
 
-#ifndef TGC_MULTI_THREADED
 static_assert(sizeof(ClassMeta) <= sizeof(void*) * 3,
-              "too large for lambda heavy programs");
-#endif
+              "too large for small objects");
 
 //////////////////////////////////////////////////////////////////////////
 
@@ -195,7 +191,7 @@ class PtrBase {
   PtrBase(void* obj);
   ~PtrBase();
 
-  void writeBarriers();
+  void writeBarrier();
   bool isRoot() const { return !owner; }
 
  protected:
@@ -216,15 +212,15 @@ class GcPtr : public PtrBase {
   // Constructors
 
   GcPtr() {}
-  GcPtr(ObjMeta* m) { reset((T*)m->objPtr(), m); }
-  explicit GcPtr(T* obj) : PtrBase(obj), p(obj) {}
+  GcPtr(ObjMeta* m) { reset(m); }
+  explicit GcPtr(T* obj) : PtrBase(obj) {}
   template <typename U>
   GcPtr(const GcPtr<U>& r) {
-    reset(static_cast<T*>(r.p), r.meta);
+    reset(r.meta);
   }
-  GcPtr(const GcPtr& r) { reset(r.p, r.meta); }
+  GcPtr(const GcPtr& r) { reset(r.meta); }
   GcPtr(GcPtr&& r) {
-    reset(r.p, r.meta);
+    reset(r.meta);
     r = nullptr;
   }
 
@@ -232,44 +228,42 @@ class GcPtr : public PtrBase {
 
   template <typename U>
   GcPtr& operator=(const GcPtr<U>& r) {
-    reset(r.p, r.meta);
+    reset(r.meta);
     return *this;
   }
   GcPtr& operator=(const GcPtr& r) {
-    reset(r.p, r.meta);
+    reset(r.meta);
     return *this;
   }
   GcPtr& operator=(GcPtr&& r) {
-    reset(r.p, r.meta);
+    reset(r.meta);
     r = nullptr;
     return *this;
   }
-  T* operator->() const { return p; }
-  T& operator*() const { return *p; }
-  explicit operator bool() const { return p && meta; }
-  bool operator==(const GcPtr& r) const { return p == r.p; }
-  bool operator!=(const GcPtr& r) const { return p != r.p; }
+  T* operator->() const { return ptr(); }
+  T& operator*() const { return *ptr(); }
+  explicit operator bool() const { return meta; }
+  bool operator==(const GcPtr& r) const { return ptr() == r.ptr(); }
+  bool operator!=(const GcPtr& r) const { return ptr() != r.ptr(); }
   GcPtr& operator=(T* ptr) = delete;
   GcPtr& operator=(nullptr_t) {
     meta = 0;
-    p = 0;
     return *this;
   }
-  bool operator<(const GcPtr& r) const { return *p < *r.p; }
+  bool operator<(const GcPtr& r) const { return *ptr() < *r.ptr(); }
 
   // Methods
 
-  void reset(T* o, ObjMeta* n) {
-    p = o;
+  void reset(ObjMeta* n) {
     meta = n;
-    writeBarriers();
+    writeBarrier();
   }
 
  protected:
-  T* p = nullptr;
+  T* ptr() const { return meta ? (T*)meta->objPtr() : nullptr; }
 };
 
-static_assert(sizeof(GcPtr<int>) <= sizeof(void*) * 3,
+static_assert(sizeof(GcPtr<int>) <= sizeof(void*) * 2,
               "too large to pass by value");
 
 template <typename T>
@@ -308,13 +302,14 @@ class Collector {
   unordered_set<PtrBase*> intergenerationalPtrs, delayIntergenerationalPtrs;
   MetaSet newGen, oldGen;
   vector<ObjMeta*> temp;
-  list<ObjMeta*> creatingObjs;
+  vector<tuple<PtrBase*, ObjMeta*>> unrefs;
+  vector<ObjMeta*> creatingObjs;
 
   int freeObjCntOfPrevGc;
   int allocCounter = 0;
-  size_t sizeOfOldGenToFullCollect = 20 * 1024;
-  int oldGenScanCount = 2;
-  int newGenSizeForCollect = 512;
+  int scanCountToOldGen = 2;
+  size_t oldGenObjCntToFullGc = 20 * 1024;
+  int newGenObjCntToGc = 512;
   bool trace = false;
   bool full = false;
 
@@ -325,6 +320,7 @@ class Collector {
   void fullCollect();
   void collect();
   void dumpStats();
+  void reserve(int sz);
 
  private:
   Collector();
@@ -334,6 +330,7 @@ class Collector {
   void promote(ObjMeta* meta);
   ObjMeta* globalFindOwnerMeta(void* obj);
   void tryRegisterToClass(PtrBase* p);
+  void handleUnrefs();
   void handleDelayIntergenerationalPtrs();
   void mark(ObjMeta* meta);
   void fixOwner(ObjMeta* meta);
@@ -345,12 +342,8 @@ inline void gc_collect() {
   Collector::get()->collect();
 }
 
-inline void gc_full_collect() {
-  Collector::get()->fullCollect();
-}
-
-inline void gc_dumpStats() {
-  Collector::get()->dumpStats();
+inline Collector* gc_collector() {
+  return Collector::get();
 }
 
 template <typename T, typename... Args>
@@ -480,7 +473,7 @@ template <typename T>
 class gc_vector : public gc<vector<gc<T>>> {
  public:
   using gc<vector<gc<T>>>::gc;
-  gc<T>& operator[](int idx) { return (*this->p)[idx]; }
+  gc<T>& operator[](int idx) { return (*this->ptr())[idx]; }
 };
 
 template <typename T>
@@ -512,7 +505,7 @@ template <typename T>
 class gc_deque : public gc<deque<gc<T>>> {
  public:
   using gc<deque<gc<T>>>::gc;
-  gc<T>& operator[](int idx) { return (*this->p)[idx]; }
+  gc<T>& operator[](int idx) { return (*this->ptr())[idx]; }
 };
 
 template <typename T>
@@ -569,7 +562,7 @@ template <typename K, typename V>
 class gc_map : public gc<map<K, gc<V>>> {
  public:
   using gc<map<K, gc<V>>>::gc;
-  gc<V>& operator[](const K& k) { return (*this->p)[k]; }
+  gc<V>& operator[](const K& k) { return (*this->ptr())[k]; }
 };
 
 template <typename K, typename V>
@@ -604,7 +597,7 @@ template <typename K, typename V>
 class gc_unordered_map : public gc<unordered_map<K, gc<V>>> {
  public:
   using gc<unordered_map<K, gc<V>>>::gc;
-  gc<V>& operator[](const K& k) { return (*this->p)[k]; }
+  gc<V>& operator[](const K& k) { return (*this->ptr())[k]; }
 };
 
 template <typename K, typename V>
@@ -664,10 +657,9 @@ void gc_delete(gc_set<T>& p) {
 
 using details::gc;
 using details::gc_collect;
-using details::gc_dumpStats;
+using details::gc_collector;
 using details::gc_dynamic_pointer_cast;
 using details::gc_from;
-using details::gc_full_collect;
 using details::gc_function;
 using details::gc_new;
 using details::gc_new_array;
