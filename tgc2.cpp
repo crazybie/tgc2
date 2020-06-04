@@ -9,6 +9,11 @@
 namespace tgc2 {
 namespace details {
 
+template <typename T>
+void vector_erase(vector<T>& c, T& v) {
+  c.erase(remove(c.begin(), c.end(), v), c.end());
+}
+
 int ClassMeta::isCreatingObj = 0;
 
 Collector* Collector::inst = nullptr;
@@ -104,9 +109,7 @@ void ClassMeta::endNewMeta(ObjMeta* meta, bool failed) {
   auto* c = Collector::inst;
   isCreatingObj--;
   {
-    c->creatingObjs.erase(
-        remove(c->creatingObjs.begin(), c->creatingObjs.end(), meta),
-        c->creatingObjs.end());
+    vector_erase(c->creatingObjs, meta);
     if (failed) {
       c->newGen.erase(meta);
       memHandler(this, MemRequest::Dealloc, meta);
