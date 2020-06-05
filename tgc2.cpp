@@ -111,7 +111,7 @@ void ClassMeta::endNewMeta(ObjMeta* meta, bool failed) {
   {
     vector_erase(c->creatingObjs, meta);
     if (failed) {
-      c->newGen.erase(meta);
+      c->newGen.remove(meta);
       memHandler(this, MemRequest::Dealloc, meta);
     }
   }
@@ -142,8 +142,8 @@ Collector::~Collector() {
 }
 
 void Collector::reserve(int sz) {
-  newGen.reserve(sz);
-  oldGen.reserve(sz * 10);
+  // newGen.reserve(sz);
+  // oldGen.reserve(sz * 10);
   unrefs.reserve(sz * 10);
   temp.reserve(sz);
   intergenerationalPtrs.reserve(1024 * 10);
@@ -163,7 +163,7 @@ Collector* Collector::get() {
 }
 
 void Collector::addMeta(ObjMeta* meta) {
-  newGen.insert(meta);
+  newGen.push_back(meta);
   creatingObjs.push_back(meta);
 }
 
@@ -194,7 +194,7 @@ void Collector::handleDelayIntergenerationalPtrs() {
   for (auto* p : delayIntergenerationalPtrs) {
     if (p->isRoot())
       p->meta->refCntFromRoot++;
-    else if (oldGen.find(p->owner) != oldGen.end()) {
+    else if (p->owner->isOld) {
       intergenerationalPtrs.insert(p);
     }
   }
@@ -301,7 +301,8 @@ void Collector::sweep(MetaSet& gen) {
 }
 
 void Collector::promote(ObjMeta* meta) {
-  oldGen.insert(meta);
+  meta->isOld = true;
+  oldGen.push_back(meta);
   auto it = meta->klass->enumPtrs(meta);
   for (; auto* p = it->getNext();) {
     if (p->meta)

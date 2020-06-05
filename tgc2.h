@@ -64,11 +64,16 @@ class ObjMeta {
   ClassMeta* klass = nullptr;
   size_t arrayLength = 0;
   unsigned short refCntFromRoot = 0;
-  Color color;
-  unsigned char scanCountInNewGen;
+  Color color : 2;
+  unsigned char scanCountInNewGen : 3;
+  bool isOld : 1;
 
   ObjMeta(ClassMeta* c, char* o, size_t n)
-      : klass(c), arrayLength(n), scanCountInNewGen(0), color(Color::White) {}
+      : klass(c),
+        arrayLength(n),
+        scanCountInNewGen(0),
+        color(Color::White),
+        isOld(false) {}
   ~ObjMeta() {
     if (arrayLength)
       destroy();
@@ -297,7 +302,7 @@ class Collector {
   friend class ClassMeta;
   friend class PtrBase;
 
-  using MetaSet = unordered_set<ObjMeta*>;
+  using MetaSet = list<ObjMeta*>;
 
   unordered_set<PtrBase*> intergenerationalPtrs, delayIntergenerationalPtrs;
   MetaSet newGen, oldGen;
