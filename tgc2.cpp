@@ -283,13 +283,13 @@ void Collector::sweep(MetaSet& gen) {
 
     if (meta->color == ObjMeta::Color::White) {
       freeObjCntOfPrevGc++;
-      delete meta;
       it = gen.erase(it);
+      delete meta;
     } else {
       if (!full && ++meta->scanCountInNewGen >= scanCountToOldGen) {
         meta->scanCountInNewGen = 0;
-        promote(meta);
         it = newGen.erase(it);
+        promote(meta);
       } else
         ++it;
     }

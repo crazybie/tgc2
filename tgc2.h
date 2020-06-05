@@ -54,6 +54,80 @@ class ObjMeta;
 class ClassMeta;
 class PtrBase;
 class IPtrEnumerator;
+//////////////////////////////////////////////////////////////////////////
+
+namespace helper {
+
+template <typename T>
+struct list_slot {
+  T* prev;
+  T* next;
+};
+
+template <typename T>
+struct base_iterator {
+  T* ptr;
+  base_iterator(T* p) : ptr{p} {}
+  base_iterator(const base_iterator& r) : ptr{r.ptr} {}
+  T* operator*() { return ptr; }
+  T* operator->() { return ptr; }
+  bool operator!=(const base_iterator& r) const { return ptr != r.ptr; }
+};
+
+template <typename T, list_slot<T> T::*slot>
+class list {
+  T* m_first = nullptr;
+  T* m_last = nullptr;
+  size_t m_size = 0;
+
+ public:
+  struct iterator : base_iterator<T> {
+    using base_iterator<T>::base_iterator;
+    iterator& operator++() {
+      this->ptr = next(this->ptr);
+      return *this;
+    }
+  };
+
+  static T*& prev(T* p) { return (p->*slot).prev; }
+  static T*& next(T* p) { return (p->*slot).next; }
+
+  void push_back(T* v) {
+    if (m_last)
+      next(m_last) = v;
+    else
+      m_first = v;
+    prev(v) = m_last;
+    next(v) = nullptr;
+    m_last = v;
+    m_size++;
+  }
+
+  void remove(T* v) {
+    if (v == m_first)
+      m_first = next(m_first);
+    else if (auto p = prev(v))
+      next(p) = next(v);
+
+    if (v == m_last)
+      m_last = prev(m_last);
+    else if (auto n = next(v))
+      prev(n) = prev(v);
+    m_size--;
+  }
+
+  iterator erase(iterator it) {
+    auto* o = *it;
+    auto n = next(o);
+    remove(o);
+    return n;
+  }
+
+  iterator begin() { return {m_first}; }
+  iterator end() { return {nullptr}; }
+  size_t size() { return m_size; }
+};
+}  // namespace helper
 
 //////////////////////////////////////////////////////////////////////////
 
@@ -67,6 +141,7 @@ class ObjMeta {
   Color color : 2;
   unsigned char scanCountInNewGen : 3;
   bool isOld : 1;
+  helper::list_slot<ObjMeta> gen;
 
   ObjMeta(ClassMeta* c, char* o, size_t n)
       : klass(c),
@@ -85,7 +160,7 @@ class ObjMeta {
   void destroy();
 };
 
-static_assert(sizeof(ObjMeta) <= sizeof(void*) * 3,
+static_assert(sizeof(ObjMeta) <= sizeof(void*) * 5,
               "too large for small allocation");
 
 //////////////////////////////////////////////////////////////////////////
@@ -302,7 +377,8 @@ class Collector {
   friend class ClassMeta;
   friend class PtrBase;
 
-  using MetaSet = list<ObjMeta*>;
+  using MetaSet = helper::list<ObjMeta, &ObjMeta::gen>;
+  // using MetaSet = list<ObjMeta*>;
 
   unordered_set<PtrBase*> intergenerationalPtrs, delayIntergenerationalPtrs;
   MetaSet newGen, oldGen;
@@ -313,8 +389,8 @@ class Collector {
   int freeObjCntOfPrevGc;
   int allocCounter = 0;
   int scanCountToOldGen = 2;
-  size_t oldGenObjCntToFullGc = 20 * 1024;
-  int newGenObjCntToGc = 512;
+  int newGenObjCntToGc = 1024 * 10;
+  size_t oldGenObjCntToFullGc = newGenObjCntToGc * 10;
   bool trace = false;
   bool full = false;
 
