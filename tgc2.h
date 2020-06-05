@@ -54,6 +54,7 @@ class ObjMeta;
 class ClassMeta;
 class PtrBase;
 class IPtrEnumerator;
+
 //////////////////////////////////////////////////////////////////////////
 
 namespace helper {
@@ -193,19 +194,22 @@ struct PtrEnumerator : ObjPtrEnumerator {
 
 class ClassMeta {
  public:
-  enum class MemRequest { Alloc, Dctor, Dealloc, NewPtrEnumerator };
+  enum class MemRequest { Dctor, NewPtrEnumerator };
   using MemHandler = void* (*)(ClassMeta* cls, MemRequest r, void* param);
   using OffsetType = unsigned short;
+  using Alloc = void* (*)(size_t size);
+  using Dealloc = void (*)(void* ptr);
 
   MemHandler memHandler = nullptr;
   vector<OffsetType>* subPtrOffsets = nullptr;
   unsigned short size = 0;
 
   static int isCreatingObj;
+  static Alloc alloc;
+  static Dealloc dealloc;
 
   ClassMeta(MemHandler h, unsigned short sz) : memHandler(h), size(sz) {}
   ~ClassMeta() { delete subPtrOffsets; }
-
   ObjMeta* newMeta(size_t objCnt);
   void registerSubPtr(ObjMeta* owner, PtrBase* p);
   void endNewMeta(ObjMeta* meta, bool failed);
@@ -223,15 +227,6 @@ class ClassMeta {
   struct Holder {
     static void* MemHandler(ClassMeta* cls, MemRequest r, void* param) {
       switch (r) {
-        case MemRequest::Alloc: {
-          auto cnt = (size_t)param;
-          auto* p = new char[cls->size * cnt + sizeof(ObjMeta)];
-          return new (p) ObjMeta(cls, p + sizeof(ObjMeta), cnt);
-        }
-        case MemRequest::Dealloc: {
-          auto meta = (ObjMeta*)param;
-          delete[](char*) meta;
-        } break;
         case MemRequest::Dctor: {
           auto meta = (ObjMeta*)param;
           auto p = (T*)meta->objPtr();

@@ -15,7 +15,10 @@ void vector_erase(vector<T>& c, T& v) {
 }
 
 int ClassMeta::isCreatingObj = 0;
-
+ClassMeta::Alloc ClassMeta::alloc = [](size_t sz) {
+  return (void*)new char[sz];
+};
+ClassMeta::Dealloc ClassMeta::dealloc = [](void* p) { delete[](char*) p; };
 Collector* Collector::inst = nullptr;
 
 char IPtrEnumerator::buf[255];
@@ -31,7 +34,7 @@ void ObjMeta::destroy() {
 
 void ObjMeta::operator delete(void* p) {
   auto* m = (ObjMeta*)p;
-  m->klass->memHandler(m->klass, ClassMeta::MemRequest::Dealloc, m);
+  m->klass->dealloc(m);
 }
 
 bool ObjMeta::containsPtr(char* p) {
@@ -92,15 +95,15 @@ ObjMeta* ClassMeta::newMeta(size_t cnt) {
   try {
     if (memHandler) {
       isCreatingObj++;
-      meta = (ObjMeta*)memHandler(this, MemRequest::Alloc,
-                                  reinterpret_cast<void*>(cnt));
+      auto* p = (char*)alloc(size * cnt + sizeof(ObjMeta));
+      meta = new (p) ObjMeta(this, p + sizeof(ObjMeta), cnt);
       // Allow using gc_from(this) in the constructor of the creating object.
       c->addMeta(meta);
     }
     return meta;
   } catch (std::bad_alloc&) {
     if (meta)
-      memHandler(this, MemRequest::Dealloc, meta);
+      dealloc(meta);
     throw;
   }
 }
@@ -112,7 +115,7 @@ void ClassMeta::endNewMeta(ObjMeta* meta, bool failed) {
     vector_erase(c->creatingObjs, meta);
     if (failed) {
       c->newGen.remove(meta);
-      memHandler(this, MemRequest::Dealloc, meta);
+      dealloc(meta);
     }
   }
 }
