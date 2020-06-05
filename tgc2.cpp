@@ -15,10 +15,8 @@ void vector_erase(vector<T>& c, T& v) {
 }
 
 int ClassMeta::isCreatingObj = 0;
-ClassMeta::Alloc ClassMeta::alloc = [](size_t sz) {
-  return (void*)new char[sz];
-};
-ClassMeta::Dealloc ClassMeta::dealloc = [](void* p) { delete[](char*) p; };
+ClassMeta::Alloc ClassMeta::alloc = nullptr;
+ClassMeta::Dealloc ClassMeta::dealloc = nullptr;
 Collector* Collector::inst = nullptr;
 
 char IPtrEnumerator::buf[255];
@@ -34,7 +32,7 @@ void ObjMeta::destroy() {
 
 void ObjMeta::operator delete(void* p) {
   auto* m = (ObjMeta*)p;
-  m->klass->dealloc(m);
+  m->klass->callDealloc(m);
 }
 
 bool ObjMeta::containsPtr(char* p) {
@@ -95,7 +93,7 @@ ObjMeta* ClassMeta::newMeta(size_t cnt) {
   try {
     if (memHandler) {
       isCreatingObj++;
-      auto* p = (char*)alloc(size * cnt + sizeof(ObjMeta));
+      auto* p = callAlloc(size * cnt + sizeof(ObjMeta));
       meta = new (p) ObjMeta(this, p + sizeof(ObjMeta), cnt);
       // Allow using gc_from(this) in the constructor of the creating object.
       c->addMeta(meta);
@@ -103,7 +101,7 @@ ObjMeta* ClassMeta::newMeta(size_t cnt) {
     return meta;
   } catch (std::bad_alloc&) {
     if (meta)
-      dealloc(meta);
+      callDealloc(meta);
     throw;
   }
 }
@@ -115,7 +113,7 @@ void ClassMeta::endNewMeta(ObjMeta* meta, bool failed) {
     vector_erase(c->creatingObjs, meta);
     if (failed) {
       c->newGen.remove(meta);
-      dealloc(meta);
+      callDealloc(meta);
     }
   }
 }
@@ -260,6 +258,7 @@ void Collector::fixOwner(ObjMeta* meta) {
 
 void Collector::collectNewGen() {
   freeObjCntOfPrevGc = 0;
+  newGenGcCount++;
 
   for (auto meta : newGen)
     fixOwner(meta);
@@ -317,6 +316,7 @@ void Collector::promote(ObjMeta* meta) {
 void Collector::fullCollect() {
   freeObjCntOfPrevGc = 0;
   full = true;
+  fullGcCount++;
 
   for (auto meta : newGen)
     fixOwner(meta);
@@ -362,6 +362,8 @@ void Collector::dumpStats() {
     if (i->arrayLength)
       liveCnt++;
   printf("[live objects   ] %3d\n", liveCnt);
+  printf("[new gen gc cnt ] %3d\n", newGenGcCount);
+  printf("[full gen gc cnt] %3d\n", fullGcCount);
   printf("[last freed objs] %3d\n", freeObjCntOfPrevGc);
   printf("=======================\n");
 }

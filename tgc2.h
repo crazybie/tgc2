@@ -222,6 +222,9 @@ class ClassMeta {
     return &Holder<T>::inst;
   }
 
+  char* callAlloc(size_t sz) { return alloc ? (char*)alloc(sz) : new char[sz]; }
+  void callDealloc(void* p) { dealloc ? dealloc(p) : delete[](char*)(p); }
+
  private:
   template <typename T>
   struct Holder {
@@ -382,6 +385,10 @@ class Collector {
   vector<ObjMeta*> creatingObjs;
 
   int freeObjCntOfPrevGc;
+
+  int newGenGcCount = 0;
+  int fullGcCount = 0;
+
   int allocCounter = 0;
   int scanCountToOldGen = 2;
   int newGenObjCntToGc = 1024 * 10;
@@ -397,6 +404,7 @@ class Collector {
   void collect();
   void dumpStats();
   void reserve(int sz);
+  void resetCounters() { newGenGcCount = fullGcCount = 0; }
 
  private:
   Collector();
