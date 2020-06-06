@@ -123,7 +123,8 @@ class list {
     remove(o);
     return n;
   }
-
+  T* back() { return m_last; }
+  void pop_back() { remove(m_last); }
   iterator begin() { return {m_first}; }
   iterator end() { return {nullptr}; }
   size_t size() { return m_size; }
@@ -148,7 +149,7 @@ class ObjMeta {
       : klass(c),
         arrayLength(n),
         scanCountInNewGen(0),
-        color(Color::White),
+        color(Color::Black),
         isOld(false) {}
   ~ObjMeta() {
     if (arrayLength)
@@ -169,7 +170,7 @@ static_assert(sizeof(ObjMeta) <= sizeof(void*) * 5,
 class IPtrEnumerator {
  public:
   virtual ~IPtrEnumerator() {}
-  virtual PtrBase* getNext() = 0;
+  virtual const PtrBase* getNext() = 0;
 
   static char buf[255];
   void* operator new(size_t) { return buf; }
@@ -274,7 +275,7 @@ class PtrBase {
 
  protected:
   ObjMeta* meta = nullptr;
-  ObjMeta* owner = nullptr;
+  mutable ObjMeta* owner = nullptr;
 };
 
 template <typename T>
@@ -294,6 +295,8 @@ class GcPtr : public PtrBase {
   explicit GcPtr(T* obj) : PtrBase(obj) {}
   template <typename U>
   GcPtr(const GcPtr<U>& r) {
+    // static_assert((U*)(T*)0 == 0, "not support multi-inheritance");
+    static_assert(is_base_of_v<T, U>, "invalid pointer cast");
     reset(r.meta);
   }
   GcPtr(const GcPtr& r) { reset(r.meta); }
@@ -375,25 +378,28 @@ class Collector {
   friend class ClassMeta;
   friend class PtrBase;
 
+#if 0
+  using MetaSet = list<ObjMeta*>;
+#else
   using MetaSet = helper::list<ObjMeta, &ObjMeta::gen>;
-  // using MetaSet = list<ObjMeta*>;
+#endif
 
-  unordered_set<PtrBase*> intergenerationalPtrs, delayIntergenerationalPtrs;
+  unordered_set<const PtrBase*> intergenerationalPtrs,
+      delayIntergenerationalPtrs;
   MetaSet newGen, oldGen;
   vector<ObjMeta*> temp;
   vector<tuple<PtrBase*, ObjMeta*>> unrefs;
   vector<ObjMeta*> creatingObjs;
 
-  int freeObjCntOfPrevGc;
-
+  int freeObjCntOfPrevGc = 0;
   int newGenGcCount = 0;
   int fullGcCount = 0;
-
   int allocCounter = 0;
+  bool trace = false;
+
   int scanCountToOldGen = 2;
   int newGenObjCntToGc = 1024 * 10;
   size_t oldGenObjCntToFullGc = newGenObjCntToGc * 10;
-  bool trace = false;
   bool full = false;
 
   static Collector* inst;
@@ -475,8 +481,10 @@ gc<To> gc_static_pointer_cast(gc<From>& from) {
 // used as std::shared_ptr
 template <typename To, typename From>
 gc<To> gc_dynamic_pointer_cast(gc<From>& from) {
+  static_assert((From*)(To*)0 == 0, "not support multi-inheritance");
   gc<To> r;
-  r.reset(dynamic_cast<To*>(from.operator->()), from.getMeta());
+  if (dynamic_cast<To*>(from.operator->()))
+    r.reset(from.getMeta());
   return r;
 }
 
@@ -564,7 +572,7 @@ template <typename T>
 struct PtrEnumerator<vector<gc<T>>> : ContainerPtrEnumerator<vector<gc<T>>> {
   using ContainerPtrEnumerator<vector<gc<T>>>::ContainerPtrEnumerator;
 
-  PtrBase* getNext() override {
+  const PtrBase* getNext() override {
     return this->hasNext() ? &*this->it++ : nullptr;
   }
 };
@@ -596,7 +604,9 @@ template <typename T>
 struct PtrEnumerator<deque<gc<T>>> : ContainerPtrEnumerator<deque<gc<T>>> {
   using ContainerPtrEnumerator<deque<gc<T>>>::ContainerPtrEnumerator;
 
-  const PtrBase* getNext() override { return &*this->it++; }
+  const PtrBase* getNext() override {
+    return this->hasNext() ? &*this->it++ : nullptr;
+  }
 };
 
 template <typename T, typename... Args>
@@ -622,7 +632,9 @@ template <typename T>
 struct PtrEnumerator<list<gc<T>>> : ContainerPtrEnumerator<list<gc<T>>> {
   using ContainerPtrEnumerator<list<gc<T>>>::ContainerPtrEnumerator;
 
-  const PtrBase* getNext() override { return &*this->it++; }
+  const PtrBase* getNext() override {
+    return this->hasNext() ? &*this->it++ : nullptr;
+  }
 };
 
 template <typename T, typename... Args>
@@ -654,6 +666,8 @@ struct PtrEnumerator<map<K, gc<V>>> : ContainerPtrEnumerator<map<K, gc<V>>> {
   using ContainerPtrEnumerator<map<K, gc<V>>>::ContainerPtrEnumerator;
 
   const PtrBase* getNext() override {
+    if (!this->hasNext())
+      return nullptr;
     auto* ret = &this->it->second;
     ++this->it;
     return ret;
@@ -690,6 +704,8 @@ struct PtrEnumerator<unordered_map<K, gc<V>>>
   using ContainerPtrEnumerator<unordered_map<K, gc<V>>>::ContainerPtrEnumerator;
 
   const PtrBase* getNext() override {
+    if (!this->hasNext())
+      return nullptr;
     auto* ret = &this->it->second;
     ++this->it;
     return ret;
@@ -718,7 +734,9 @@ template <typename V>
 struct PtrEnumerator<set<gc<V>>> : ContainerPtrEnumerator<set<gc<V>>> {
   using ContainerPtrEnumerator<set<gc<V>>>::ContainerPtrEnumerator;
 
-  const PtrBase* getNext() override { return &*this->it++; }
+  const PtrBase* getNext() override {
+    return this->hasNext() ? &*this->it++ : nullptr;
+  }
 };
 
 template <typename V, typename... Args>

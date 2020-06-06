@@ -134,21 +134,23 @@ Collector::Collector() {
 }
 
 Collector::~Collector() {
-  for (auto i : newGen) {
+  while (newGen.size()) {
+    auto i = newGen.back();
+    newGen.pop_back();
     delete i;
   }
-  for (auto i : oldGen) {
+  while (oldGen.size()) {
+    auto i = oldGen.back();
+    oldGen.pop_back();
     delete i;
   }
 }
 
 void Collector::reserve(int sz) {
-  // newGen.reserve(sz);
-  // oldGen.reserve(sz * 10);
-  unrefs.reserve(sz * 10);
+  unrefs.reserve(sz);
   temp.reserve(sz);
-  intergenerationalPtrs.reserve(1024 * 10);
-  delayIntergenerationalPtrs.reserve(1024 * 10);
+  intergenerationalPtrs.reserve(sz);
+  delayIntergenerationalPtrs.reserve(1024 / 2);
 }
 
 Collector* Collector::get() {
@@ -215,7 +217,8 @@ void Collector::mark(ObjMeta* meta) {
       auto* ptrIt = meta->klass->enumPtrs(meta);
       for (; auto* child = ptrIt->getNext();) {
         if (auto* m = child->meta) {
-          temp.push_back(m);
+          if (m->color == ObjMeta::Color::White)
+            temp.push_back(m);
         }
       }
       delete ptrIt;
@@ -234,18 +237,24 @@ void Collector::mark(ObjMeta* meta) {
 // Need to fix for every pass as containers can be modified at any time.
 void Collector::fixOwner(ObjMeta* meta) {
   auto doFix = [&](ObjMeta* meta) {
-    // sweep function cannot reset color of intergenerational objects.
-    meta->color = ObjMeta::Color::White;
+    // fix for circular references.
+    if (meta->color == ObjMeta::Color::Black) {
+      // sweep function cannot reset color of intergenerational objects.
+      meta->color = ObjMeta::Color::White;
 
-    auto* it = meta->klass->enumPtrs(meta);
-    for (; auto* ptr = it->getNext();) {
-      ptr->owner = meta;
-      if (ptr->meta) {
-        ptr->meta->refCntFromRoot = 0;
-        temp.push_back(ptr->meta);
+      auto* it = meta->klass->enumPtrs(meta);
+      for (; auto* ptr = it->getNext();) {
+        ptr->owner = meta;
+        if (auto* subMeta = ptr->meta) {
+          subMeta->refCntFromRoot = 0;
+
+          // fix for circular references.
+          if (subMeta->color == ObjMeta::Color::Black)
+            temp.push_back(ptr->meta);
+        }
       }
+      delete it;
     }
-    delete it;
   };
 
   doFix(meta);
