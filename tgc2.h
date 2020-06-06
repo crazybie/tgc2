@@ -136,10 +136,12 @@ class list {
 class ObjMeta {
  public:
   enum class Color : unsigned char { White, Black };
+  static constexpr unsigned char Magic = 0xdd;
 
   ClassMeta* klass = nullptr;
   size_t arrayLength = 0;
   unsigned short refCntFromRoot = 0;
+  unsigned char magic = Magic;
   Color color : 2;
   unsigned char scanCountInNewGen : 3;
   bool isOld : 1;
@@ -295,7 +297,6 @@ class GcPtr : public PtrBase {
   explicit GcPtr(T* obj) : PtrBase(obj) {}
   template <typename U>
   GcPtr(const GcPtr<U>& r) {
-    // static_assert((U*)(T*)0 == 0, "not support multi-inheritance");
     static_assert(is_base_of_v<T, U>, "invalid pointer cast");
     reset(r.meta);
   }
@@ -309,6 +310,7 @@ class GcPtr : public PtrBase {
 
   template <typename U>
   GcPtr& operator=(const GcPtr<U>& r) {
+    static_assert(is_base_of_v<T, U>, "invalid pointer cast");
     reset(r.meta);
     return *this;
   }
@@ -378,7 +380,7 @@ class Collector {
   friend class ClassMeta;
   friend class PtrBase;
 
-#if 0
+#if 1
   using MetaSet = list<ObjMeta*>;
 #else
   using MetaSet = helper::list<ObjMeta, &ObjMeta::gen>;
@@ -398,8 +400,8 @@ class Collector {
   bool trace = false;
 
   int scanCountToOldGen = 2;
-  int newGenObjCntToGc = 1024 * 10;
-  size_t oldGenObjCntToFullGc = newGenObjCntToGc * 10;
+  int newGenObjCntToGc;
+  size_t oldGenObjCntToFullGc;
   bool full = false;
 
   static Collector* inst;
@@ -409,7 +411,7 @@ class Collector {
   void fullCollect();
   void collect();
   void dumpStats();
-  void reserve(int sz);
+  void config(int newGenObjCntToGc, int oldGenObjCntToFullGc, int newGenSize);
   void resetCounters() { newGenGcCount = fullGcCount = 0; }
 
  private:
@@ -473,18 +475,17 @@ gc<T> gc_from(T* o) {
 }
 
 // used as std::shared_ptr
-template <typename To, typename From>
-gc<To> gc_static_pointer_cast(gc<From>& from) {
+template <typename Derive, typename Base>
+gc<Derive> gc_static_pointer_cast(gc<Base>& from) {
   return from;
 }
 
 // used as std::shared_ptr
-template <typename To, typename From>
-gc<To> gc_dynamic_pointer_cast(gc<From>& from) {
-  static_assert((From*)(To*)0 == 0, "not support multi-inheritance");
-  gc<To> r;
-  if (dynamic_cast<To*>(from.operator->()))
-    r.reset(from.getMeta());
+template <typename Derive, typename Base>
+gc<Derive> gc_dynamic_pointer_cast(gc<Base>& from) {
+  static_assert(is_base_of_v<Base, Derive>, "not support multi-inheritance");
+  gc<Derive> r;
+  r.reset(from.getMeta());
   return r;
 }
 

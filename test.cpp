@@ -1,8 +1,9 @@
-#include "tgc2.h"
-
 #include <assert.h>
+
 #include <chrono>
 #include <iostream>
+
+#include "tgc2.h"
 
 using namespace tgc2;
 using namespace std;
@@ -46,7 +47,7 @@ struct rc {
 };
 
 void testPointerCast() {
-#if 0
+#if 1
   {
     gc<rc> prc = gc_new<rc>();
     {
@@ -263,15 +264,13 @@ void testDynamicCast() {
     int c;
   };
   auto sub = gc_new<Sub>();
-  gc<BaseA> baseB = sub;
+  gc<BaseA> baseA = sub;
+
+  auto sub2 = gc_dynamic_pointer_cast<Sub>(baseA);
+  assert(sub == sub2);
 
   // Cant compile:
-  // auto sub2 = gc_dynamic_pointer_cast<Sub>(baseB);
-  // assert(sub == sub2);
-
-  // Cant compile:
-  // auto sub2 = gc_dynamic_pointer_cast<Sub>(baseB);
-  // assert(sub == sub2);
+  // auto sub3 = gc_dynamic_pointer_cast<BaseB>(baseA);
 }
 
 void testException() {
@@ -344,33 +343,33 @@ void profileAlloc() {
 
 int main() {
   // profileAlloc();
-  testCollection();
-  testException();
+  // testCollection();
+  // testException();
 
-  testDynamicCast();
+  // testDynamicCast();
 
-  testGcFromThis();
-  testCircledContainer();
-  testPrimaryImplicitCtor();
-  testSet();
-  testEmpty();
-
+  // testGcFromThis();
+  // testCircledContainer();
+  // testPrimaryImplicitCtor();
+  // testSet();
+  // testEmpty();
+  //
   // testPointerCast();
 
   testMoveCtor();
   testCirc();
   testArray();
-  testList();
+  // testList();
   testDeque();
-  testHashMap();
-  testLambda();
+  // testHashMap();
+  // testLambda();
 
   // there are some objects leaked from the upper tests, just dump them
   // out.
-  // gc_collector()->dumpStats();
+  gc_collector()->dumpStats();
   gc_collect();
   // there should be no objects exists after the collecting.
-  // gc_collector()->dumpStats();
+  gc_collector()->dumpStats();
 
   // leaking test, you should not see leaks in the output of VS.
   auto i = gc_new<int>(100);

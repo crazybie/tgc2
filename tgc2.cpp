@@ -130,7 +130,7 @@ void ClassMeta::registerSubPtr(ObjMeta* owner, PtrBase* p) {
 //////////////////////////////////////////////////////////////////////////
 
 Collector::Collector() {
-  reserve(1024 * 10);
+  config(1024 * 10, 0, 1024 * 10);
 }
 
 Collector::~Collector() {
@@ -146,17 +146,23 @@ Collector::~Collector() {
   }
 }
 
-void Collector::reserve(int sz) {
-  unrefs.reserve(sz);
-  temp.reserve(sz);
-  intergenerationalPtrs.reserve(sz);
+void Collector::config(int newGenObjCntToGc,
+                       int oldGenObjCntToFullGc,
+                       int tempSpaceReserveSize) {
+  this->newGenObjCntToGc = newGenObjCntToGc;
+  this->oldGenObjCntToFullGc =
+      oldGenObjCntToFullGc > 0 ? oldGenObjCntToFullGc : newGenGcCount * 10;
+  unrefs.reserve(tempSpaceReserveSize);
+  temp.reserve(tempSpaceReserveSize);
+  intergenerationalPtrs.reserve(tempSpaceReserveSize);
   delayIntergenerationalPtrs.reserve(1024 / 2);
 }
 
 Collector* Collector::get() {
   if (!inst) {
 #ifdef _WIN32
-    _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
+    _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF |
+                   _CRTDBG_CHECK_ALWAYS_DF);
 #endif
 
     inst = new Collector();
@@ -206,7 +212,10 @@ void Collector::handleDelayIntergenerationalPtrs() {
 
 ObjMeta* Collector::globalFindOwnerMeta(void* obj) {
   auto* meta = (ObjMeta*)((char*)obj - sizeof(ObjMeta));
-  return meta;
+  if (meta->magic == ObjMeta::Magic)
+    return meta;
+  else
+    return nullptr;
 }
 
 void Collector::mark(ObjMeta* meta) {
