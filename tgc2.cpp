@@ -18,7 +18,6 @@ int ClassMeta::isCreatingObj = 0;
 ClassMeta::Alloc ClassMeta::alloc = nullptr;
 ClassMeta::Dealloc ClassMeta::dealloc = nullptr;
 Collector* Collector::inst = nullptr;
-
 char IPtrEnumerator::buf[255];
 
 //////////////////////////////////////////////////////////////////////////
@@ -65,8 +64,9 @@ PtrBase::PtrBase() : isRoot(true), isOld(false) {
 
 PtrBase::PtrBase(void* obj) : isRoot(true), isOld(false) {
   auto* c = Collector::inst ? Collector::inst : Collector::get();
-  meta = c->globalFindOwnerMeta(obj);
   c->tryRegisterToClass(this);
+  meta = c->globalFindOwnerMeta(obj);
+  writeBarrier();
 }
 
 PtrBase::~PtrBase() {
@@ -84,7 +84,7 @@ void PtrBase::writeBarrier() {
 ObjMeta* ClassMeta::newMeta(size_t cnt) {
   auto* c = Collector::inst ? Collector::inst : Collector::get();
 
-  if (c->allocCounter++ % c->newGenObjCntToGc == 0)
+  if (c->gcCond->needGcNewGen(c))
     c->collect();
 
   ObjMeta* meta = nullptr;
@@ -124,7 +124,12 @@ void ClassMeta::registerSubPtr(ObjMeta* owner, PtrBase* p) {
 //////////////////////////////////////////////////////////////////////////
 
 Collector::Collector() {
-  config(1024 * 10, 0, 1024 * 10);
+  roots.reserve(1024 * 10);
+  unrefs.reserve(1024 * 10);
+  temp.reserve(1024 * 10);
+  intergenerationalPtrs.reserve(1024 * 10);
+  delayIntergenerationalPtrs.reserve(1024 * 10);
+  setGcCondition(new GcCondition_Time);
 }
 
 Collector::~Collector() {
@@ -138,24 +143,6 @@ Collector::~Collector() {
     oldGen.pop_back();
     delete i;
   }
-}
-
-void Collector::config(int newGenObjCntToGc,
-                       int oldGenObjCntToFullGc,
-                       int tempSize) {
-  if (!tempSize)
-    tempSize = 1024 * 10;
-  if (!oldGenObjCntToFullGc)
-    oldGenObjCntToFullGc = newGenObjCntToGc * 10;
-
-  this->newGenObjCntToGc = newGenObjCntToGc;
-  this->oldGenObjCntToFullGc = oldGenObjCntToFullGc;
-
-  roots.reserve(newGenObjCntToGc);
-  unrefs.reserve(tempSize);
-  temp.reserve(tempSize);
-  intergenerationalPtrs.reserve(tempSize);
-  delayIntergenerationalPtrs.reserve(1024 / 2);
 }
 
 Collector* Collector::get() {
@@ -332,7 +319,7 @@ void Collector::fullCollect() {
 
   for (auto meta : newGen)
     preMark(meta);
-  for (auto* meta : oldGen)
+  for (auto meta : oldGen)
     preMark(meta);
 
   handleUnrefs();
@@ -350,7 +337,7 @@ void Collector::fullCollect() {
 }
 
 void Collector::collect() {
-  if (oldGen.size() > oldGenObjCntToFullGc) {
+  if (gcCond->needFullGc(this)) {
     fullCollect();
   } else {
     collectNewGen();
@@ -359,8 +346,8 @@ void Collector::collect() {
 
 void Collector::dumpStats() {
   printf("========= [gc] ========\n");
-  printf("[newGen meta    ] %3d\n", (unsigned)newGen.size());
-  printf("[oldGen meta    ] %3d\n", (unsigned)oldGen.size());
+  printf("[newGen meta    ] %3d\n", newGen.size());
+  printf("[oldGen meta    ] %3d\n", oldGen.size());
   auto liveCnt = 0;
   for (auto i : newGen)
     if (i->arrayLength)
@@ -370,7 +357,7 @@ void Collector::dumpStats() {
       liveCnt++;
   printf("[live objects   ] %3d\n", liveCnt);
   printf("[new gen gc cnt ] %3d\n", newGenGcCount);
-  printf("[full gen gc cnt] %3d\n", fullGcCount);
+  printf("[full gc cnt    ] %3d\n", fullGcCount);
   printf("[last freed objs] %3d\n", freeObjCntOfPrevGc);
   printf("=======================\n");
 }

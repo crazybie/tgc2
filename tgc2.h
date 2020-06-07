@@ -30,6 +30,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 //#define TGC_MULTI_THREADED
 
 #include <cassert>
+#include <ctime>
 #include <memory>
 #include <set>
 #include <typeinfo>
@@ -140,8 +141,8 @@ class ObjMeta {
 
   ClassMeta* klass = nullptr;
   size_t arrayLength = 0;
-  unsigned char magic = Magic;
   Color color;
+  unsigned char magic = Magic;
   unsigned char scanCountInNewGen;
   helper::list_slot<ObjMeta> gen;
 
@@ -191,7 +192,7 @@ struct PtrEnumerator : ObjPtrEnumerator {
 class ClassMeta {
  public:
   enum class MemRequest { Dctor, NewPtrEnumerator };
-  using MemHandler = void* (*)(ClassMeta* cls, MemRequest r, void* param);
+  using MemHandler = void* (*)(ClassMeta* cls, MemRequest r, ObjMeta* meta);
   using OffsetType = unsigned short;
   using Alloc = void* (*)(size_t size);
   using Dealloc = void (*)(void* ptr);
@@ -224,17 +225,15 @@ class ClassMeta {
  private:
   template <typename T>
   struct Holder {
-    static void* MemHandler(ClassMeta* cls, MemRequest r, void* param) {
+    static void* MemHandler(ClassMeta* cls, MemRequest r, ObjMeta* meta) {
       switch (r) {
         case MemRequest::Dctor: {
-          auto meta = (ObjMeta*)param;
           auto p = (T*)meta->objPtr();
           for (size_t i = 0; i < meta->arrayLength; i++, p++) {
             p->~T();
           }
         } break;
         case MemRequest::NewPtrEnumerator: {
-          auto meta = (ObjMeta*)param;
           return new PtrEnumerator<T>(meta);
         } break;
       }
@@ -369,6 +368,12 @@ class gc : public GcPtr<T> {
 
 //////////////////////////////////////////////////////////////////////////
 
+struct GcCondition {
+  virtual ~GcCondition() {}
+  virtual bool needGcNewGen(Collector* c) = 0;
+  virtual bool needFullGc(Collector* c) = 0;
+};
+
 class Collector {
   friend class ClassMeta;
   friend class PtrBase;
@@ -387,15 +392,12 @@ class Collector {
   vector<ObjMeta*> creatingObjs;
 
   int freeObjCntOfPrevGc = 0;
-  int newGenGcCount = 0;
   int fullGcCount = 0;
-  int allocCounter = 0;
-  bool trace = false;
-
+  int newGenGcCount = 0;
   int scanCountToOldGen = 2;
-  int newGenObjCntToGc;
-  size_t oldGenObjCntToFullGc;
+  bool trace = false;
   bool full = false;
+  GcCondition* gcCond = nullptr;
 
   static Collector* inst;
 
@@ -404,10 +406,13 @@ class Collector {
   void fullCollect();
   void collect();
   void dumpStats();
-  void config(int newGenObjCntToGc,
-              int oldGenObjCntToFullGc = 0,
-              int tempSize = 0);
   void resetCounters() { newGenGcCount = fullGcCount = 0; }
+  size_t getNewGenSize() { return newGen.size(); }
+  size_t getOldGenSize() { return oldGen.size(); }
+  void setGcCondition(GcCondition* c) {
+    delete gcCond;
+    gcCond = c;
+  }
 
  private:
   Collector();
@@ -424,6 +429,45 @@ class Collector {
   void collectNewGen();
   void addMeta(ObjMeta* meta);
 };
+
+struct GcCondition_ObjCnt : GcCondition {
+  int counter = 0;
+  int newGenObjCntToGc = 512;
+  size_t oldGenObjCntToFullGc = 1024 * 10;
+
+  bool needGcNewGen(Collector* c) override {
+    return counter++ > newGenObjCntToGc;
+  }
+  bool needFullGc(Collector* c) override {
+    return c->getOldGenSize() > oldGenObjCntToFullGc;
+  }
+};
+
+struct GcCondition_Time : GcCondition {
+  int gcPeriodMs = 10;
+  clock_t lastGcTime;
+  int newGenGcCntToFullGc = 1024;
+  int newGenGcCnt = 0;
+
+  bool needGcNewGen(Collector* c) override {
+    auto nowClock = clock();
+    if (nowClock - lastGcTime > (CLOCKS_PER_SEC / 1000 * gcPeriodMs)) {
+      lastGcTime = nowClock;
+      newGenGcCnt++;
+      return true;
+    }
+    return false;
+  }
+  bool needFullGc(Collector* c) override {
+    if (newGenGcCnt > newGenGcCntToFullGc) {
+      newGenGcCnt = 0;
+      return true;
+    }
+    return false;
+  }
+};
+
+//////////////////////////////////////////////////////////////////////////
 
 inline void gc_collect() {
   Collector::get()->collect();
