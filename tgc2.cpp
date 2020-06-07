@@ -9,8 +9,8 @@
 namespace tgc2 {
 namespace details {
 
-template <typename T>
-void vector_erase(vector<T>& c, T& v) {
+template <typename C>
+void vector_erase(C& c, typename C::value_type& v) {
   c.erase(remove(c.begin(), c.end(), v), c.end());
 }
 

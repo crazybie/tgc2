@@ -32,6 +32,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <cassert>
 #include <ctime>
 #include <memory>
+#include <memory_resource>
 #include <set>
 #include <typeinfo>
 #include <vector>
@@ -379,17 +380,31 @@ class Collector {
   friend class PtrBase;
 
 #if 0
-  using MetaSet = list<ObjMeta*>;
+  using MetaSet = pmr::list<ObjMeta*>;
+
+  std::pmr::unsynchronized_pool_resource rs;
+  MetaSet newGen{&rs}, oldGen{&rs};
+
+  pmr::unordered_set<const PtrBase*> intergenerationalPtrs{&rs},
+      delayIntergenerationalPtrs{&rs}, roots{&rs};
+
+  pmr::vector<ObjMeta*> temp{&rs};
+  pmr::vector<PtrBase*> unrefs{&rs};
+  pmr::vector<ObjMeta*> creatingObjs{&rs};
+
 #else
+  // using MetaSet = list<ObjMeta*>;
   using MetaSet = helper::list<ObjMeta, &ObjMeta::gen>;
-#endif
+
+  MetaSet newGen, oldGen;
 
   unordered_set<const PtrBase*> intergenerationalPtrs,
       delayIntergenerationalPtrs, roots;
-  MetaSet newGen, oldGen;
+
   vector<ObjMeta*> temp;
   vector<PtrBase*> unrefs;
   vector<ObjMeta*> creatingObjs;
+#endif
 
   int freeObjCntOfPrevGc = 0;
   int fullGcCount = 0;
