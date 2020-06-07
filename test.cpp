@@ -318,7 +318,7 @@ void testCollection() {
   }
 }
 
-const int profilingCounts = 10000 * 100;
+const int profilingCounts = 1024 * 1024;
 
 auto profiled = [](const char* tag, auto cb) {
   auto start = std::chrono::high_resolution_clock::now();
@@ -342,27 +342,27 @@ void profileAlloc() {
 }
 
 int main() {
-  // profileAlloc();
-  // testCollection();
-  // testException();
+  profileAlloc();
+  testCollection();
+  testException();
 
-  // testDynamicCast();
+  testDynamicCast();
 
-  // testGcFromThis();
-  // testCircledContainer();
-  // testPrimaryImplicitCtor();
-  // testSet();
-  // testEmpty();
-  //
-  // testPointerCast();
+  testGcFromThis();
+  testCircledContainer();
+  testPrimaryImplicitCtor();
+  testSet();
+  testEmpty();
+
+  testPointerCast();
 
   testMoveCtor();
   testCirc();
   testArray();
-  // testList();
+  testList();
   testDeque();
-  // testHashMap();
-  // testLambda();
+  testHashMap();
+  testLambda();
 
   // there are some objects leaked from the upper tests, just dump them
   // out.

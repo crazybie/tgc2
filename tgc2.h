@@ -140,25 +140,18 @@ class ObjMeta {
 
   ClassMeta* klass = nullptr;
   size_t arrayLength = 0;
-  unsigned short refCntFromRoot = 0;
   unsigned char magic = Magic;
-  Color color : 2;
-  unsigned char scanCountInNewGen : 3;
-  bool isOld : 1;
+  Color color;
+  unsigned char scanCountInNewGen;
   helper::list_slot<ObjMeta> gen;
 
   ObjMeta(ClassMeta* c, char* o, size_t n)
-      : klass(c),
-        arrayLength(n),
-        scanCountInNewGen(0),
-        color(Color::Black),
-        isOld(false) {}
+      : klass(c), arrayLength(n), scanCountInNewGen(0), color(Color::Black) {}
   ~ObjMeta() {
     if (arrayLength)
       destroy();
   }
   void operator delete(void* c);
-  bool isRoot() const { return refCntFromRoot > 0; }
   bool containsPtr(char* p);
   char* objPtr() const { return (char*)this + sizeof(ObjMeta); }
   void destroy();
@@ -273,11 +266,11 @@ class PtrBase {
   ~PtrBase();
 
   void writeBarrier();
-  bool isRoot() const { return !owner; }
 
  protected:
   ObjMeta* meta = nullptr;
-  mutable ObjMeta* owner = nullptr;
+  mutable bool isOld;
+  mutable bool isRoot;
 };
 
 template <typename T>
@@ -380,17 +373,17 @@ class Collector {
   friend class ClassMeta;
   friend class PtrBase;
 
-#if 1
+#if 0
   using MetaSet = list<ObjMeta*>;
 #else
   using MetaSet = helper::list<ObjMeta, &ObjMeta::gen>;
 #endif
 
   unordered_set<const PtrBase*> intergenerationalPtrs,
-      delayIntergenerationalPtrs;
+      delayIntergenerationalPtrs, roots;
   MetaSet newGen, oldGen;
   vector<ObjMeta*> temp;
-  vector<tuple<PtrBase*, ObjMeta*>> unrefs;
+  vector<PtrBase*> unrefs;
   vector<ObjMeta*> creatingObjs;
 
   int freeObjCntOfPrevGc = 0;
@@ -411,7 +404,9 @@ class Collector {
   void fullCollect();
   void collect();
   void dumpStats();
-  void config(int newGenObjCntToGc, int oldGenObjCntToFullGc, int newGenSize);
+  void config(int newGenObjCntToGc,
+              int oldGenObjCntToFullGc = 0,
+              int tempSize = 0);
   void resetCounters() { newGenGcCount = fullGcCount = 0; }
 
  private:
@@ -425,7 +420,7 @@ class Collector {
   void handleUnrefs();
   void handleDelayIntergenerationalPtrs();
   void mark(ObjMeta* meta);
-  void fixOwner(ObjMeta* meta);
+  void preMark(ObjMeta* meta);
   void collectNewGen();
   void addMeta(ObjMeta* meta);
 };

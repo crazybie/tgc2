@@ -58,12 +58,12 @@ PtrBase* ObjPtrEnumerator::getNext() {
 
 //////////////////////////////////////////////////////////////////////////
 
-PtrBase::PtrBase() {
+PtrBase::PtrBase() : isRoot(true), isOld(false) {
   auto* c = Collector::inst ? Collector::inst : Collector::get();
   c->tryRegisterToClass(this);
 }
 
-PtrBase::PtrBase(void* obj) {
+PtrBase::PtrBase(void* obj) : isRoot(true), isOld(false) {
   auto* c = Collector::inst ? Collector::inst : Collector::get();
   meta = c->globalFindOwnerMeta(obj);
   c->tryRegisterToClass(this);
@@ -71,7 +71,7 @@ PtrBase::PtrBase(void* obj) {
 
 PtrBase::~PtrBase() {
   auto* c = Collector::inst;
-  c->unrefs.emplace_back(this, meta);
+  c->unrefs.emplace_back(this);
 }
 
 void PtrBase::writeBarrier() {
@@ -82,8 +82,6 @@ void PtrBase::writeBarrier() {
 //////////////////////////////////////////////////////////////////////////
 
 ObjMeta* ClassMeta::newMeta(size_t cnt) {
-  assert(memHandler && "should not be called in global scope (before main)");
-
   auto* c = Collector::inst ? Collector::inst : Collector::get();
 
   if (c->allocCounter++ % c->newGenObjCntToGc == 0)
@@ -91,13 +89,11 @@ ObjMeta* ClassMeta::newMeta(size_t cnt) {
 
   ObjMeta* meta = nullptr;
   try {
-    if (memHandler) {
-      isCreatingObj++;
-      auto* p = callAlloc(size * cnt + sizeof(ObjMeta));
-      meta = new (p) ObjMeta(this, p + sizeof(ObjMeta), cnt);
-      // Allow using gc_from(this) in the constructor of the creating object.
-      c->addMeta(meta);
-    }
+    isCreatingObj++;
+    auto* p = callAlloc(size * cnt + sizeof(ObjMeta));
+    meta = new (p) ObjMeta(this, p + sizeof(ObjMeta), cnt);
+    // Allow using gc_from(this) in the constructor of the creating object.
+    c->addMeta(meta);
     return meta;
   } catch (std::bad_alloc&) {
     if (meta)
@@ -109,12 +105,10 @@ ObjMeta* ClassMeta::newMeta(size_t cnt) {
 void ClassMeta::endNewMeta(ObjMeta* meta, bool failed) {
   auto* c = Collector::inst;
   isCreatingObj--;
-  {
-    vector_erase(c->creatingObjs, meta);
-    if (failed) {
-      c->newGen.remove(meta);
-      callDealloc(meta);
-    }
+  vector_erase(c->creatingObjs, meta);
+  if (failed) {
+    c->newGen.remove(meta);
+    callDealloc(meta);
   }
 }
 
@@ -148,21 +142,26 @@ Collector::~Collector() {
 
 void Collector::config(int newGenObjCntToGc,
                        int oldGenObjCntToFullGc,
-                       int tempSpaceReserveSize) {
+                       int tempSize) {
+  if (!tempSize)
+    tempSize = 1024 * 10;
+  if (!oldGenObjCntToFullGc)
+    oldGenObjCntToFullGc = newGenObjCntToGc * 10;
+
   this->newGenObjCntToGc = newGenObjCntToGc;
-  this->oldGenObjCntToFullGc =
-      oldGenObjCntToFullGc > 0 ? oldGenObjCntToFullGc : newGenGcCount * 10;
-  unrefs.reserve(tempSpaceReserveSize);
-  temp.reserve(tempSpaceReserveSize);
-  intergenerationalPtrs.reserve(tempSpaceReserveSize);
+  this->oldGenObjCntToFullGc = oldGenObjCntToFullGc;
+
+  roots.reserve(newGenObjCntToGc);
+  unrefs.reserve(tempSize);
+  temp.reserve(tempSize);
+  intergenerationalPtrs.reserve(tempSize);
   delayIntergenerationalPtrs.reserve(1024 / 2);
 }
 
 Collector* Collector::get() {
   if (!inst) {
 #ifdef _WIN32
-    _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF |
-                   _CRTDBG_CHECK_ALWAYS_DF);
+    _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
 #endif
 
     inst = new Collector();
@@ -189,21 +188,19 @@ void Collector::tryRegisterToClass(PtrBase* p) {
 }
 
 void Collector::handleUnrefs() {
-  for (auto& [ptr, meta] : unrefs) {
+  for (auto ptr : unrefs) {
     intergenerationalPtrs.erase(ptr);
     delayIntergenerationalPtrs.erase(ptr);
-
-    if (meta && meta->refCntFromRoot > 0)
-      meta->refCntFromRoot--;
+    roots.erase(ptr);
   }
   unrefs.clear();
 }
 
 void Collector::handleDelayIntergenerationalPtrs() {
   for (auto* p : delayIntergenerationalPtrs) {
-    if (p->isRoot())
-      p->meta->refCntFromRoot++;
-    else if (p->owner->isOld) {
+    if (p->isRoot)
+      roots.insert(p);
+    else if (p->isOld) {
       intergenerationalPtrs.insert(p);
     }
   }
@@ -243,9 +240,8 @@ void Collector::mark(ObjMeta* meta) {
 }
 
 // Unified way for objects and containers.
-// Need to fix for every pass as containers can be modified at any time.
-void Collector::fixOwner(ObjMeta* meta) {
-  auto doFix = [&](ObjMeta* meta) {
+void Collector::preMark(ObjMeta* meta) {
+  auto work = [&](ObjMeta* meta) {
     // fix for circular references.
     if (meta->color == ObjMeta::Color::Black) {
       // sweep function cannot reset color of intergenerational objects.
@@ -253,10 +249,8 @@ void Collector::fixOwner(ObjMeta* meta) {
 
       auto* it = meta->klass->enumPtrs(meta);
       for (; auto* ptr = it->getNext();) {
-        ptr->owner = meta;
+        ptr->isRoot = false;
         if (auto* subMeta = ptr->meta) {
-          subMeta->refCntFromRoot = 0;
-
           // fix for circular references.
           if (subMeta->color == ObjMeta::Color::Black)
             temp.push_back(ptr->meta);
@@ -266,11 +260,11 @@ void Collector::fixOwner(ObjMeta* meta) {
     }
   };
 
-  doFix(meta);
+  work(meta);
   while (temp.size()) {
     auto* m = temp.back();
     temp.pop_back();
-    doFix(m);
+    work(m);
   }
 }
 
@@ -279,14 +273,14 @@ void Collector::collectNewGen() {
   newGenGcCount++;
 
   for (auto meta : newGen)
-    fixOwner(meta);
+    preMark(meta);
 
   handleUnrefs();
   handleDelayIntergenerationalPtrs();
 
-  for (auto meta : newGen) {
-    if (meta->isRoot()) {
-      mark(meta);
+  for (auto ptr : roots) {
+    if (ptr->meta && !ptr->isOld) {
+      mark(ptr->meta);
     }
   }
 
@@ -321,10 +315,10 @@ void Collector::sweep(MetaSet& gen) {
 }
 
 void Collector::promote(ObjMeta* meta) {
-  meta->isOld = true;
   oldGen.push_back(meta);
   auto it = meta->klass->enumPtrs(meta);
   for (; auto* p = it->getNext();) {
+    p->isOld = true;
     if (p->meta)
       intergenerationalPtrs.insert(p);
   }
@@ -337,21 +331,16 @@ void Collector::fullCollect() {
   fullGcCount++;
 
   for (auto meta : newGen)
-    fixOwner(meta);
+    preMark(meta);
   for (auto* meta : oldGen)
-    fixOwner(meta);
+    preMark(meta);
 
   handleUnrefs();
   handleDelayIntergenerationalPtrs();
 
-  for (auto meta : newGen) {
-    if (meta->isRoot()) {
-      mark(meta);
-    }
-  }
-  for (auto* meta : oldGen) {
-    if (meta->isRoot()) {
-      mark(meta);
+  for (auto ptr : roots) {
+    if (ptr->meta) {
+      mark(ptr->meta);
     }
   }
 
