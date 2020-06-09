@@ -56,11 +56,11 @@ class ObjMeta;
 class ClassMeta;
 class PtrBase;
 class IPtrEnumerator;
+class Collector;
 
 //////////////////////////////////////////////////////////////////////////
 
 namespace helper {
-
 template <typename T>
 struct list_slot {
   T* prev;
@@ -145,6 +145,7 @@ class ObjMeta {
   Color color;
   unsigned char magic = Magic;
   unsigned char scanCountInNewGen;
+  bool hasSubPtrs = true;
   helper::list_slot<ObjMeta> gen;
 
   ObjMeta(ClassMeta* c, char* o, size_t n)
@@ -212,6 +213,8 @@ class ClassMeta {
   void registerSubPtr(ObjMeta* owner, PtrBase* p);
   void endNewMeta(ObjMeta* meta, bool failed);
   IPtrEnumerator* enumPtrs(ObjMeta* m) {
+    if (!m->hasSubPtrs)
+      return nullptr;
     return (IPtrEnumerator*)memHandler(this, MemRequest::NewPtrEnumerator, m);
   }
 
@@ -463,10 +466,13 @@ struct GcCondition_Time : GcCondition {
   clock_t lastGcTime;
   int newGenGcCntToFullGc = 1024;
   int newGenGcCnt = 0;
+  int counter = 0;
 
   bool needGcNewGen(Collector* c) override {
     auto nowClock = clock();
-    if (nowClock - lastGcTime > (CLOCKS_PER_SEC / 1000 * gcPeriodMs)) {
+    if (counter++ > 1024 * 10 &&
+        nowClock - lastGcTime > (CLOCKS_PER_SEC / 1000 * gcPeriodMs)) {
+      counter = 0;
       lastGcTime = nowClock;
       newGenGcCnt++;
       return true;

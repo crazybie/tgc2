@@ -207,14 +207,15 @@ void Collector::mark(ObjMeta* meta) {
     if (meta->color == ObjMeta::Color::White) {
       meta->color = ObjMeta::Color::Black;
 
-      auto* ptrIt = meta->klass->enumPtrs(meta);
-      for (; auto* child = ptrIt->getNext();) {
-        if (auto* m = child->meta) {
-          if (m->color == ObjMeta::Color::White)
-            temp.push_back(m);
+      if (auto* ptrIt = meta->klass->enumPtrs(meta)) {
+        for (; auto* child = ptrIt->getNext();) {
+          if (auto* m = child->meta) {
+            if (m->color == ObjMeta::Color::White)
+              temp.push_back(m);
+          }
         }
+        delete ptrIt;
       }
-      delete ptrIt;
     }
   };
 
@@ -234,16 +235,22 @@ void Collector::preMark(ObjMeta* meta) {
       // sweep function cannot reset color of intergenerational objects.
       meta->color = ObjMeta::Color::White;
 
-      auto* it = meta->klass->enumPtrs(meta);
-      for (; auto* ptr = it->getNext();) {
-        ptr->isRoot = false;
-        if (auto* subMeta = ptr->meta) {
-          // fix for circular references.
-          if (subMeta->color == ObjMeta::Color::Black)
-            temp.push_back(ptr->meta);
+      meta->hasSubPtrs = true;
+      if (auto* it = meta->klass->enumPtrs(meta)) {
+        meta->hasSubPtrs = false;
+
+        for (; auto* ptr = it->getNext();) {
+          ptr->isRoot = false;
+          meta->hasSubPtrs = true;
+
+          if (auto* subMeta = ptr->meta) {
+            // fix for circular references.
+            if (subMeta->color == ObjMeta::Color::Black)
+              temp.push_back(ptr->meta);
+          }
         }
+        delete it;
       }
-      delete it;
     }
   };
 
@@ -303,13 +310,14 @@ void Collector::sweep(MetaSet& gen) {
 
 void Collector::promote(ObjMeta* meta) {
   oldGen.push_back(meta);
-  auto it = meta->klass->enumPtrs(meta);
-  for (; auto* p = it->getNext();) {
-    p->isOld = true;
-    if (p->meta)
-      intergenerationalPtrs.insert(p);
+  if (auto it = meta->klass->enumPtrs(meta)) {
+    for (; auto* p = it->getNext();) {
+      p->isOld = true;
+      if (p->meta)
+        intergenerationalPtrs.insert(p);
+    }
+    delete it;
   }
-  delete it;
 }
 
 void Collector::fullCollect() {
