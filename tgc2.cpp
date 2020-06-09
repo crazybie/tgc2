@@ -169,6 +169,7 @@ void Collector::tryRegisterToClass(PtrBase* p) {
       auto* owner = *i;
       if (owner->containsPtr((char*)p)) {
         owner->klass->registerSubPtr(owner, p);
+        break;
       }
     }
   }
@@ -279,7 +280,8 @@ void Collector::collectNewGen() {
   }
 
   for (auto ptr : intergenerationalPtrs) {
-    mark(ptr->meta);
+    if (ptr->meta)
+      mark(ptr->meta);
   }
 
   sweep(newGen);
