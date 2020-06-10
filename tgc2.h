@@ -1,6 +1,6 @@
 /*
 
-TGC: Tiny incremental mark & sweep Garbage Collector.
+TGC: Tiny generational mark & sweep Garbage Collector.
 
 //////////////////////////////////////////////////////////////////////////
 
@@ -422,6 +422,7 @@ class Collector {
  public:
   static Collector* get();
   void fullCollect();
+  void collectNewGen();
   void collect();
   void dumpStats();
   void resetCounters() { newGenGcCount = fullGcCount = 0; }
@@ -444,7 +445,6 @@ class Collector {
   void handleDelayIntergenerationalPtrs();
   void mark(ObjMeta* meta);
   void preMark(ObjMeta* meta);
-  void collectNewGen();
   void addMeta(ObjMeta* meta);
 };
 
