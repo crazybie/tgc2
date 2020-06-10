@@ -1,6 +1,6 @@
 /*
 
-TGC: Tiny incremental mark & sweep Garbage Collector.
+TGC: Tiny generational mark & sweep Garbage Collector.
 
 //////////////////////////////////////////////////////////////////////////
 
@@ -61,6 +61,7 @@ class Collector;
 //////////////////////////////////////////////////////////////////////////
 
 namespace helper {
+
 template <typename T>
 struct list_slot {
   T* prev;
@@ -68,13 +69,13 @@ struct list_slot {
 };
 
 template <typename T>
-struct base_iterator {
+struct list_iterator_base {
   T* ptr;
-  base_iterator(T* p) : ptr{p} {}
-  base_iterator(const base_iterator& r) : ptr{r.ptr} {}
+  list_iterator_base(T* p) : ptr{p} {}
+  list_iterator_base(const list_iterator_base& r) : ptr{r.ptr} {}
   T* operator*() { return ptr; }
   T* operator->() { return ptr; }
-  bool operator!=(const base_iterator& r) const { return ptr != r.ptr; }
+  bool operator!=(const list_iterator_base& r) const { return ptr != r.ptr; }
 };
 
 template <typename T, list_slot<T> T::*slot>
@@ -84,8 +85,8 @@ class list {
   size_t m_size = 0;
 
  public:
-  struct iterator : base_iterator<T> {
-    using base_iterator<T>::base_iterator;
+  struct iterator : list_iterator_base<T> {
+    using list_iterator_base<T>::list_iterator_base;
     iterator& operator++() {
       this->ptr = next(this->ptr);
       return *this;
@@ -212,6 +213,12 @@ class ClassMeta {
   ObjMeta* newMeta(size_t objCnt);
   void registerSubPtr(ObjMeta* owner, PtrBase* p);
   void endNewMeta(ObjMeta* meta, bool failed);
+  static char* callAlloc(size_t sz) {
+    return alloc ? (char*)alloc(sz) : new char[sz];
+  }
+  static void callDealloc(void* p) {
+    dealloc ? dealloc(p) : delete[](char*)(p);
+  }
   IPtrEnumerator* enumPtrs(ObjMeta* m) {
     if (!m->hasSubPtrs)
       return nullptr;
@@ -222,9 +229,6 @@ class ClassMeta {
   static ClassMeta* get() {
     return &Holder<T>::inst;
   }
-
-  char* callAlloc(size_t sz) { return alloc ? (char*)alloc(sz) : new char[sz]; }
-  void callDealloc(void* p) { dealloc ? dealloc(p) : delete[](char*)(p); }
 
  private:
   template <typename T>
@@ -267,7 +271,6 @@ class PtrBase {
   PtrBase();
   PtrBase(void* obj);
   ~PtrBase();
-
   void writeBarrier();
 
  protected:
@@ -382,32 +385,17 @@ class Collector {
   friend class ClassMeta;
   friend class PtrBase;
 
-#if 0
-  using MetaSet = pmr::list<ObjMeta*>;
-
-  std::pmr::unsynchronized_pool_resource rs;
-  MetaSet newGen{&rs}, oldGen{&rs};
-
-  pmr::unordered_set<const PtrBase*> intergenerationalPtrs{&rs},
-      delayIntergenerationalPtrs{&rs}, roots{&rs};
-
-  pmr::vector<ObjMeta*> temp{&rs};
-  pmr::vector<PtrBase*> unrefs{&rs};
-  pmr::vector<ObjMeta*> creatingObjs{&rs};
-
-#else
   // using MetaSet = list<ObjMeta*>;
   using MetaSet = helper::list<ObjMeta, &ObjMeta::gen>;
 
   MetaSet newGen, oldGen;
-
-  unordered_set<const PtrBase*> intergenerationalPtrs,
-      delayIntergenerationalPtrs, roots;
-
+  vector<ObjMeta*> creatingObjs;
   vector<ObjMeta*> temp;
   vector<PtrBase*> unrefs;
-  vector<ObjMeta*> creatingObjs;
-#endif
+  unordered_set<const PtrBase*> roots;
+  unordered_set<const PtrBase*> intergenerationalPtrs;
+  unordered_set<const PtrBase*> delayIntergenerationalPtrs;
+  GcCondition* gcCond = nullptr;
 
   int freeObjCntOfPrevGc = 0;
   int fullGcCount = 0;
@@ -415,13 +403,13 @@ class Collector {
   int scanCountToOldGen = 2;
   bool trace = false;
   bool full = false;
-  GcCondition* gcCond = nullptr;
 
   static Collector* inst;
 
  public:
   static Collector* get();
   void fullCollect();
+  void collectNewGen();
   void collect();
   void dumpStats();
   void resetCounters() { newGenGcCount = fullGcCount = 0; }
@@ -444,7 +432,6 @@ class Collector {
   void handleDelayIntergenerationalPtrs();
   void mark(ObjMeta* meta);
   void preMark(ObjMeta* meta);
-  void collectNewGen();
   void addMeta(ObjMeta* meta);
 };
 

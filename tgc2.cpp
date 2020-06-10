@@ -9,16 +9,18 @@
 namespace tgc2 {
 namespace details {
 
-template <typename C>
-void vector_erase(C& c, typename C::value_type& v) {
-  c.erase(remove(c.begin(), c.end(), v), c.end());
-}
-
 int ClassMeta::isCreatingObj = 0;
 ClassMeta::Alloc ClassMeta::alloc = nullptr;
 ClassMeta::Dealloc ClassMeta::dealloc = nullptr;
 Collector* Collector::inst = nullptr;
 char IPtrEnumerator::buf[255];
+
+//////////////////////////////////////////////////////////////////////////
+
+template <typename C>
+void vector_remove(C& c, typename C::value_type& v) {
+  c.erase(remove(c.begin(), c.end(), v), c.end());
+}
 
 //////////////////////////////////////////////////////////////////////////
 
@@ -84,7 +86,7 @@ void PtrBase::writeBarrier() {
 ObjMeta* ClassMeta::newMeta(size_t cnt) {
   auto* c = Collector::inst ? Collector::inst : Collector::get();
 
-  if (c->gcCond->needGcNewGen(c))
+  if (c->gcCond && c->gcCond->needGcNewGen(c))
     c->collect();
 
   ObjMeta* meta = nullptr;
@@ -105,7 +107,7 @@ ObjMeta* ClassMeta::newMeta(size_t cnt) {
 void ClassMeta::endNewMeta(ObjMeta* meta, bool failed) {
   auto* c = Collector::inst;
   isCreatingObj--;
-  vector_erase(c->creatingObjs, meta);
+  vector_remove(c->creatingObjs, meta);
   if (failed) {
     c->newGen.remove(meta);
     callDealloc(meta);
@@ -122,6 +124,18 @@ void ClassMeta::registerSubPtr(ObjMeta* owner, PtrBase* p) {
 }
 
 //////////////////////////////////////////////////////////////////////////
+
+Collector* Collector::get() {
+  if (!inst) {
+#ifdef _WIN32
+    _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
+#endif
+
+    inst = new Collector();
+    atexit([] { delete inst; });
+  }
+  return inst;
+}
 
 Collector::Collector() {
   roots.reserve(1024 * 10);
@@ -145,18 +159,6 @@ Collector::~Collector() {
   }
 }
 
-Collector* Collector::get() {
-  if (!inst) {
-#ifdef _WIN32
-    _CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
-#endif
-
-    inst = new Collector();
-    atexit([] { delete inst; });
-  }
-  return inst;
-}
-
 void Collector::addMeta(ObjMeta* meta) {
   newGen.push_back(meta);
   creatingObjs.push_back(meta);
@@ -169,6 +171,7 @@ void Collector::tryRegisterToClass(PtrBase* p) {
       auto* owner = *i;
       if (owner->containsPtr((char*)p)) {
         owner->klass->registerSubPtr(owner, p);
+        break;
       }
     }
   }
@@ -279,7 +282,8 @@ void Collector::collectNewGen() {
   }
 
   for (auto ptr : intergenerationalPtrs) {
-    mark(ptr->meta);
+    if (ptr->meta)
+      mark(ptr->meta);
   }
 
   sweep(newGen);
@@ -345,7 +349,7 @@ void Collector::fullCollect() {
 }
 
 void Collector::collect() {
-  if (gcCond->needFullGc(this)) {
+  if (gcCond && gcCond->needFullGc(this)) {
     fullCollect();
   } else {
     collectNewGen();
