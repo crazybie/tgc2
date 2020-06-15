@@ -145,6 +145,22 @@ void testArray() {
   gc_delete(a);
 }
 
+static int unref = 0;
+struct Val {
+  ~Val() { unref++; }
+};
+
+void testContinusVector() {
+  struct Obj {
+    gc<Val> v = gc_new<Val>();
+  };
+
+  int cnt = 3, clsRegisterCnt = 1;
+  { auto c = gc_new<vector<Obj>>(cnt); }
+  gc_collector()->fullCollect();
+  assert(unref == cnt + clsRegisterCnt);
+}
+
 void testCircledContainer() {
   static int delCnt = 0;
   struct Node {
@@ -359,6 +375,7 @@ int main() {
   testMoveCtor();
   testCirc();
   testArray();
+  testContinusVector();
   testList();
   testDeque();
   testHashMap();

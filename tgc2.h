@@ -171,17 +171,27 @@ class IPtrEnumerator {
   virtual ~IPtrEnumerator() {}
   virtual const PtrBase* getNext() = 0;
 
-  static char buf[255];
-  void* operator new(size_t) { return buf; }
-  void operator delete(void*) {}
+  static vector<char*> buf;
+  void* operator new(size_t) {
+    if (buf.size()) {
+      auto* ret = buf.back();
+      buf.pop_back();
+      return ret;
+    }
+    return new char[255];
+  }
+  void operator delete(void* p) { buf.push_back((char*)p); }
 };
 
 class ObjPtrEnumerator : public IPtrEnumerator {
   size_t subPtrIdx = 0, arrayElemIdx = 0;
-  ObjMeta* meta = nullptr;
+  ClassMeta* klass;
+  char* base;
+  size_t len;
 
  public:
-  ObjPtrEnumerator(ObjMeta* m) : meta(m) {}
+  ObjPtrEnumerator(ClassMeta* c, char* o, size_t l)
+      : klass(c), base(o), len(l) {}
   PtrBase* getNext() override;
 };
 
@@ -195,7 +205,10 @@ struct PtrEnumerator : ObjPtrEnumerator {
 class ClassMeta {
  public:
   enum class MemRequest { Dctor, NewPtrEnumerator };
-  using MemHandler = void* (*)(ClassMeta* cls, MemRequest r, ObjMeta* meta);
+  using MemHandler = void* (*)(ClassMeta* cls,
+                               MemRequest r,
+                               void* obj,
+                               size_t len);
   using OffsetType = unsigned short;
   using Alloc = void* (*)(size_t size);
   using Dealloc = void (*)(void* ptr);
@@ -203,6 +216,7 @@ class ClassMeta {
   MemHandler memHandler = nullptr;
   vector<OffsetType>* subPtrOffsets = nullptr;
   unsigned short size = 0;
+  bool registered = false;
 
   static int isCreatingObj;
   static Alloc alloc;
@@ -213,16 +227,27 @@ class ClassMeta {
   ObjMeta* newMeta(size_t objCnt);
   void registerSubPtr(ObjMeta* owner, PtrBase* p);
   void endNewMeta(ObjMeta* meta, bool failed);
+
+  template <typename T>
+  void ensureRegistered();
+
+  IPtrEnumerator* enumPtrs(void* obj, size_t len) {
+    return (IPtrEnumerator*)memHandler(this, MemRequest::NewPtrEnumerator, obj,
+                                       len);
+  }
+
+  IPtrEnumerator* enumPtrs(ObjMeta* m) {
+    if (!m->hasSubPtrs)
+      return nullptr;
+    return (IPtrEnumerator*)memHandler(this, MemRequest::NewPtrEnumerator,
+                                       m->objPtr(), m->arrayLength);
+  }
+
   static char* callAlloc(size_t sz) {
     return alloc ? (char*)alloc(sz) : new char[sz];
   }
   static void callDealloc(void* p) {
     dealloc ? dealloc(p) : delete[](char*)(p);
-  }
-  IPtrEnumerator* enumPtrs(ObjMeta* m) {
-    if (!m->hasSubPtrs)
-      return nullptr;
-    return (IPtrEnumerator*)memHandler(this, MemRequest::NewPtrEnumerator, m);
   }
 
   template <typename T>
@@ -233,16 +258,19 @@ class ClassMeta {
  private:
   template <typename T>
   struct Holder {
-    static void* MemHandler(ClassMeta* cls, MemRequest r, ObjMeta* meta) {
+    static void* MemHandler(ClassMeta* klass,
+                            MemRequest r,
+                            void* obj,
+                            size_t len) {
       switch (r) {
         case MemRequest::Dctor: {
-          auto p = (T*)meta->objPtr();
-          for (size_t i = 0; i < meta->arrayLength; i++, p++) {
+          auto p = (T*)obj;
+          for (size_t i = 0; i < len; i++, p++) {
             p->~T();
           }
         } break;
         case MemRequest::NewPtrEnumerator: {
-          return new PtrEnumerator<T>(meta);
+          return new PtrEnumerator<T>(klass, (char*)obj, len);
         } break;
       }
       return nullptr;
@@ -546,6 +574,13 @@ gc<T> gc_new_array(size_t len, Args&&... args) {
   return gc_new_meta<T>(len, forward<Args>(args)...);
 }
 
+template <typename T>
+void ClassMeta::ensureRegistered() {
+  if (!registered) {
+    gc_new_meta<T>(1)->destroy();
+  }
+}
+
 //////////////////////////////////////////////////////////////////////////
 /// Function
 
@@ -598,23 +633,15 @@ class gc_function<R(A...)> {
 
 template <typename C>
 struct ContainerPtrEnumerator : IPtrEnumerator {
-  C* o;
+  C* con;
   typename C::iterator it;
-  ContainerPtrEnumerator(ObjMeta* m) : o((C*)m->objPtr()), it(o->begin()) {}
-  bool hasNext() { return it != o->end(); }
+  ContainerPtrEnumerator(ClassMeta* c, char* o, size_t l)
+      : con((C*)o), it(con->begin()) {}
+  bool hasNext() { return it != con->end(); }
 };
 
 //////////////////////////////////////////////////////////////////////////
 /// Vector
-/// vector elements are not stored contiguously due to implementation
-/// limitation. use gc_new_array for better performance.
-
-template <typename T>
-class gc_vector : public gc<vector<gc<T>>> {
- public:
-  using gc<vector<gc<T>>>::gc;
-  gc<T>& operator[](int idx) { return (*this->ptr())[idx]; }
-};
 
 template <typename T>
 struct PtrEnumerator<vector<gc<T>>> : ContainerPtrEnumerator<vector<gc<T>>> {
@@ -623,6 +650,33 @@ struct PtrEnumerator<vector<gc<T>>> : ContainerPtrEnumerator<vector<gc<T>>> {
   const PtrBase* getNext() override {
     return this->hasNext() ? &*this->it++ : nullptr;
   }
+};
+
+template <typename T>
+struct PtrEnumerator<vector<T>> : ContainerPtrEnumerator<vector<T>> {
+  using ContainerPtrEnumerator<vector<T>>::ContainerPtrEnumerator;
+
+  IPtrEnumerator* ptrEnum = nullptr;
+
+  virtual ~PtrEnumerator() { delete ptrEnum; }
+
+  const PtrBase* getNext() override {
+    if (sizeof(T) >= sizeof(gc<T>)) {
+      if (!ptrEnum) {
+        auto* klass = ClassMeta::get<T>();
+        klass->ensureRegistered<T>();
+        ptrEnum = klass->enumPtrs(this->con->data(), this->con->size());
+      }
+    }
+    return ptrEnum ? ptrEnum->getNext() : nullptr;
+  }
+};
+
+template <typename T>
+class gc_vector : public gc<vector<gc<T>>> {
+ public:
+  using gc<vector<gc<T>>>::gc;
+  gc<T>& operator[](int idx) { return (*this->ptr())[idx]; }
 };
 
 template <typename T, typename... Args>

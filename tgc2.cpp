@@ -13,7 +13,7 @@ int ClassMeta::isCreatingObj = 0;
 ClassMeta::Alloc ClassMeta::alloc = nullptr;
 ClassMeta::Dealloc ClassMeta::dealloc = nullptr;
 Collector* Collector::inst = nullptr;
-char IPtrEnumerator::buf[255];
+vector<char*> IPtrEnumerator::buf;
 
 //////////////////////////////////////////////////////////////////////////
 
@@ -27,7 +27,7 @@ void vector_remove(C& c, typename C::value_type& v) {
 void ObjMeta::destroy() {
   if (!arrayLength)
     return;
-  klass->memHandler(klass, ClassMeta::MemRequest::Dctor, this);
+  klass->memHandler(klass, ClassMeta::MemRequest::Dctor, objPtr(), arrayLength);
   arrayLength = 0;
 }
 
@@ -44,13 +44,15 @@ bool ObjMeta::containsPtr(char* p) {
 //////////////////////////////////////////////////////////////////////////
 
 PtrBase* ObjPtrEnumerator::getNext() {
-  if (auto* subPtrs = meta->klass->subPtrOffsets) {
-    if (arrayElemIdx < meta->arrayLength && subPtrIdx < subPtrs->size()) {
-      auto* klass = meta->klass;
-      auto* obj = meta->objPtr() + arrayElemIdx * klass->size;
+  assert(klass->registered);
+  if (auto* subPtrs = klass->subPtrOffsets) {
+    if (arrayElemIdx < len && subPtrIdx < subPtrs->size()) {
+      auto* obj = base + arrayElemIdx * klass->size;
       auto* subPtr = obj + (*klass->subPtrOffsets)[subPtrIdx];
-      if (subPtrIdx++ >= klass->subPtrOffsets->size())
+      if (++subPtrIdx >= klass->subPtrOffsets->size()) {
         arrayElemIdx++;
+        subPtrIdx = 0;
+      }
       return (PtrBase*)subPtr;
     }
   }
@@ -111,6 +113,8 @@ void ClassMeta::endNewMeta(ObjMeta* meta, bool failed) {
   if (failed) {
     c->newGen.remove(meta);
     callDealloc(meta);
+  } else {
+    meta->klass->registered = true;
   }
 }
 
@@ -119,8 +123,9 @@ void ClassMeta::registerSubPtr(ObjMeta* owner, PtrBase* p) {
   if (!subPtrOffsets) {
     subPtrOffsets = new vector<OffsetType>();
     subPtrOffsets->push_back(offset);
-  } else if (offset > subPtrOffsets->back())
+  } else if (offset > subPtrOffsets->back()) {  // constructor recursived
     subPtrOffsets->push_back(offset);
+  }
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -157,6 +162,10 @@ Collector::~Collector() {
     oldGen.pop_back();
     delete i;
   }
+  for (auto* i : IPtrEnumerator::buf)
+    delete[] i;
+
+  delete gcCond;
 }
 
 void Collector::addMeta(ObjMeta* meta) {
@@ -169,7 +178,7 @@ void Collector::tryRegisterToClass(PtrBase* p) {
     // owner may not be the current one(e.g. constructor recursed)
     for (auto i = creatingObjs.rbegin(); i != creatingObjs.rend(); ++i) {
       auto* owner = *i;
-      if (owner->containsPtr((char*)p)) {
+      if (!owner->klass->registered && owner->containsPtr((char*)p)) {
         owner->klass->registerSubPtr(owner, p);
         break;
       }
