@@ -4,7 +4,7 @@ TGC: Tiny generational mark & sweep Garbage Collector.
 
 //////////////////////////////////////////////////////////////////////////
 
-Copyright (C) 2018 soniced@sina.com
+Copyright (C) 2020 soniced@sina.com
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of
 this software and associated documentation files (the "Software"), to deal in
@@ -27,23 +27,19 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #pragma once
 
-//#define TGC_MULTI_THREADED
-
 #include <cassert>
 #include <ctime>
 #include <memory>
-#include <memory_resource>
-#include <set>
-#include <typeinfo>
+#include <unordered_set>
 #include <vector>
 
 // for STL wrappers
 #include <deque>
 #include <list>
 #include <map>
+#include <set>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 
 namespace tgc2 {
 namespace details {
@@ -142,12 +138,12 @@ class ObjMeta {
   static constexpr unsigned char Magic = 0xdd;
 
   ClassMeta* klass = nullptr;
+  helper::list_slot<ObjMeta> gen;
   size_t arrayLength = 0;
   Color color;
   unsigned char magic = Magic;
   unsigned char scanCountInNewGen;
   bool hasSubPtrs = true;
-  helper::list_slot<ObjMeta> gen;
 
   ObjMeta(ClassMeta* c, char* o, size_t n)
       : klass(c), arrayLength(n), scanCountInNewGen(0), color(Color::Black) {}
@@ -172,6 +168,7 @@ class IPtrEnumerator {
   virtual const PtrBase* getNext() = 0;
 
   static vector<char*> buf;
+
   void* operator new(size_t) {
     if (buf.size()) {
       auto* ret = buf.back();
@@ -205,6 +202,7 @@ struct PtrEnumerator : ObjPtrEnumerator {
 class ClassMeta {
  public:
   enum class MemRequest { Dctor, NewPtrEnumerator };
+
   using MemHandler = void* (*)(ClassMeta* cls,
                                MemRequest r,
                                void* obj,
@@ -228,12 +226,9 @@ class ClassMeta {
   void registerSubPtr(ObjMeta* owner, PtrBase* p);
   void endNewMeta(ObjMeta* meta, bool failed);
 
-  template <typename T>
-  void ensureRegistered();
-
-  IPtrEnumerator* enumPtrs(void* obj, size_t len) {
+  IPtrEnumerator* enumPtrs(void* obj, size_t cnt) {
     return (IPtrEnumerator*)memHandler(this, MemRequest::NewPtrEnumerator, obj,
-                                       len);
+                                       cnt);
   }
 
   IPtrEnumerator* enumPtrs(ObjMeta* m) {
@@ -255,22 +250,25 @@ class ClassMeta {
     return &Holder<T>::inst;
   }
 
+  template <typename T>
+  static ClassMeta* getRegistered();
+
  private:
   template <typename T>
   struct Holder {
     static void* MemHandler(ClassMeta* klass,
                             MemRequest r,
                             void* obj,
-                            size_t len) {
+                            size_t cnt) {
       switch (r) {
         case MemRequest::Dctor: {
           auto p = (T*)obj;
-          for (size_t i = 0; i < len; i++, p++) {
+          for (size_t i = 0; i < cnt; i++, p++) {
             p->~T();
           }
         } break;
         case MemRequest::NewPtrEnumerator: {
-          return new PtrEnumerator<T>(klass, (char*)obj, len);
+          return new PtrEnumerator<T>(klass, (char*)obj, cnt);
         } break;
       }
       return nullptr;
@@ -575,10 +573,12 @@ gc<T> gc_new_array(size_t len, Args&&... args) {
 }
 
 template <typename T>
-void ClassMeta::ensureRegistered() {
-  if (!registered) {
+ClassMeta* ClassMeta::getRegistered() {
+  auto* c = get<T>();
+  if (!c->registered) {
     gc_new_meta<T>(1)->destroy();
   }
+  return c;
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -635,6 +635,7 @@ template <typename C>
 struct ContainerPtrEnumerator : IPtrEnumerator {
   C* con;
   typename C::iterator it;
+
   ContainerPtrEnumerator(ClassMeta* c, char* o, size_t l)
       : con((C*)o), it(con->begin()) {}
   bool hasNext() { return it != con->end(); }
@@ -656,19 +657,17 @@ template <typename T>
 struct PtrEnumerator<vector<T>> : ContainerPtrEnumerator<vector<T>> {
   using ContainerPtrEnumerator<vector<T>>::ContainerPtrEnumerator;
 
-  IPtrEnumerator* ptrEnum = nullptr;
-
-  virtual ~PtrEnumerator() { delete ptrEnum; }
+  unique_ptr<IPtrEnumerator> ptrIter = nullptr;
 
   const PtrBase* getNext() override {
-    if (sizeof(T) >= sizeof(gc<T>)) {
-      if (!ptrEnum) {
-        auto* klass = ClassMeta::get<T>();
-        klass->ensureRegistered<T>();
-        ptrEnum = klass->enumPtrs(this->con->data(), this->con->size());
-      }
+    if (sizeof(T) < sizeof(gc<T>)) {
+      return nullptr;
     }
-    return ptrEnum ? ptrEnum->getNext() : nullptr;
+    if (!ptrIter) {
+      ptrIter.reset(ClassMeta::getRegistered<T>()->enumPtrs(this->con->data(),
+                                                            this->con->size()));
+    }
+    return ptrIter ? ptrIter->getNext() : nullptr;
   }
 };
 
@@ -711,6 +710,32 @@ struct PtrEnumerator<deque<gc<T>>> : ContainerPtrEnumerator<deque<gc<T>>> {
   }
 };
 
+template <typename T>
+struct PtrEnumerator<deque<T>> : ContainerPtrEnumerator<deque<T>> {
+  using ContainerPtrEnumerator<deque<T>>::ContainerPtrEnumerator;
+
+  unique_ptr<IPtrEnumerator> ptrIter = nullptr;
+
+  const PtrBase* getNext() override {
+    if (sizeof(T) < sizeof(gc<T>)) {
+      return nullptr;
+    }
+
+    if (ptrIter) {
+      if (auto* r = ptrIter->getNext()) {
+        return r;
+      }
+    }
+
+    if (this->hasNext()) {
+      ptrIter.reset(ClassMeta::getRegistered<T>()->enumPtrs(&*this->it++, 1));
+      return ptrIter ? ptrIter->getNext() : nullptr;
+    } else {
+      return nullptr;
+    }
+  }
+};
+
 template <typename T, typename... Args>
 gc_deque<T> gc_new_deque(Args&&... args) {
   return gc_new_meta<deque<gc<T>>>(1, forward<Args>(args)...);
@@ -736,6 +761,32 @@ struct PtrEnumerator<list<gc<T>>> : ContainerPtrEnumerator<list<gc<T>>> {
 
   const PtrBase* getNext() override {
     return this->hasNext() ? &*this->it++ : nullptr;
+  }
+};
+
+template <typename T>
+struct PtrEnumerator<list<T>> : ContainerPtrEnumerator<list<T>> {
+  using ContainerPtrEnumerator<list<T>>::ContainerPtrEnumerator;
+
+  unique_ptr<IPtrEnumerator> ptrIter;
+
+  const PtrBase* getNext() override {
+    if (sizeof(T) < sizeof(gc<T>)) {
+      return nullptr;
+    }
+
+    if (ptrIter) {
+      if (auto* r = ptrIter->getNext()) {
+        return r;
+      }
+    }
+
+    if (this->hasNext()) {
+      ptrIter.reset(ClassMeta::getRegistered<T>()->enumPtrs(&*this->it++, 1));
+      return ptrIter ? ptrIter->getNext() : nullptr;
+    } else {
+      return nullptr;
+    }
   }
 };
 
@@ -773,6 +824,34 @@ struct PtrEnumerator<map<K, gc<V>>> : ContainerPtrEnumerator<map<K, gc<V>>> {
     auto* ret = &this->it->second;
     ++this->it;
     return ret;
+  }
+};
+
+template <typename K, typename V>
+struct PtrEnumerator<map<K, V>> : ContainerPtrEnumerator<map<K, V>> {
+  using ContainerPtrEnumerator<map<K, V>>::ContainerPtrEnumerator;
+
+  unique_ptr<IPtrEnumerator> ptrIter;
+
+  const PtrBase* getNext() override {
+    if (sizeof(V) < sizeof(gc<V>)) {
+      return nullptr;
+    }
+
+    if (ptrIter) {
+      if (auto* r = ptrIter->getNext()) {
+        return r;
+      }
+    }
+
+    if (this->hasNext()) {
+      auto* elem = &this->it->second;
+      this->it++;
+      ptrIter.reset(ClassMeta::getRegistered<V>()->enumPtrs(elem, 1));
+      return ptrIter ? ptrIter->getNext() : nullptr;
+    } else {
+      return nullptr;
+    }
   }
 };
 
@@ -814,6 +893,35 @@ struct PtrEnumerator<unordered_map<K, gc<V>>>
   }
 };
 
+template <typename K, typename V>
+struct PtrEnumerator<unordered_map<K, V>>
+    : ContainerPtrEnumerator<unordered_map<K, V>> {
+  using ContainerPtrEnumerator<unordered_map<K, V>>::ContainerPtrEnumerator;
+
+  unique_ptr<IPtrEnumerator> ptrIter;
+
+  const PtrBase* getNext() override {
+    if (sizeof(V) < sizeof(gc<V>)) {
+      return nullptr;
+    }
+
+    if (ptrIter) {
+      if (auto* r = ptrIter->getNext()) {
+        return r;
+      }
+    }
+
+    if (this->hasNext()) {
+      auto* elem = &this->it->second;
+      this->it++;
+      ptrIter.reset(ClassMeta::getRegistered<V>()->enumPtrs(elem, 1));
+      return ptrIter ? ptrIter->getNext() : nullptr;
+    } else {
+      return nullptr;
+    }
+  }
+};
+
 template <typename K, typename V, typename... Args>
 gc_unordered_map<K, V> gc_new_unordered_map(Args&&... args) {
   return gc_new_meta<unordered_map<K, gc<V>>>(1, forward<Args>(args)...);
@@ -841,6 +949,32 @@ struct PtrEnumerator<set<gc<V>>> : ContainerPtrEnumerator<set<gc<V>>> {
   }
 };
 
+template <typename V>
+struct PtrEnumerator<set<V>> : ContainerPtrEnumerator<set<V>> {
+  using ContainerPtrEnumerator<set<V>>::ContainerPtrEnumerator;
+
+  unique_ptr<IPtrEnumerator> ptrIter;
+
+  const PtrBase* getNext() override {
+    if (sizeof(V) < sizeof(gc<V>)) {
+      return nullptr;
+    }
+
+    if (ptrIter) {
+      if (auto* r = ptrIter->getNext()) {
+        return r;
+      }
+    }
+
+    if (this->hasNext()) {
+      ptrIter.reset(ClassMeta::getRegistered<V>()->enumPtrs(&*this->it++, 1));
+      return ptrIter ? ptrIter->getNext() : nullptr;
+    } else {
+      return nullptr;
+    }
+  }
+};
+
 template <typename V, typename... Args>
 gc_set<V> gc_new_set(Args&&... args) {
   return gc_new_meta<set<gc<V>>>(1, forward<Args>(args)...);
@@ -848,6 +982,62 @@ gc_set<V> gc_new_set(Args&&... args) {
 
 template <typename T>
 void gc_delete(gc_set<T>& p) {
+  for (auto i : *p) {
+    gc_delete(i);
+  }
+  p->clear();
+}
+
+//////////////////////////////////////////////////////////////////////////
+/// HashSet
+
+template <typename V>
+using gc_unordered_set = gc<unordered_set<gc<V>>>;
+
+template <typename V>
+struct PtrEnumerator<unordered_set<gc<V>>>
+    : ContainerPtrEnumerator<unordered_set<gc<V>>> {
+  using ContainerPtrEnumerator<unordered_set<gc<V>>>::ContainerPtrEnumerator;
+
+  const PtrBase* getNext() override {
+    return this->hasNext() ? &*this->it++ : nullptr;
+  }
+};
+
+template <typename V>
+struct PtrEnumerator<unordered_set<V>>
+    : ContainerPtrEnumerator<unordered_set<V>> {
+  using ContainerPtrEnumerator<unordered_set<V>>::ContainerPtrEnumerator;
+
+  unique_ptr<IPtrEnumerator> ptrIter;
+
+  const PtrBase* getNext() override {
+    if (sizeof(V) < sizeof(gc<V>)) {
+      return nullptr;
+    }
+
+    if (ptrIter) {
+      if (auto* r = ptrIter->getNext()) {
+        return r;
+      }
+    }
+
+    if (this->hasNext()) {
+      ptrIter.reset(ClassMeta::getRegistered<V>()->enumPtrs(&*this->it++, 1));
+      return ptrIter ? ptrIter->getNext() : nullptr;
+    } else {
+      return nullptr;
+    }
+  }
+};
+
+template <typename V, typename... Args>
+gc_unordered_set<V> gc_new_unordered_set(Args&&... args) {
+  return gc_new_meta<unordered_set<gc<V>>>(1, forward<Args>(args)...);
+}
+
+template <typename T>
+void gc_delete(gc_unordered_set<T>& p) {
   for (auto i : *p) {
     gc_delete(i);
   }
@@ -886,6 +1076,9 @@ using details::gc_set;
 
 using details::gc_new_unordered_map;
 using details::gc_unordered_map;
+
+using details::gc_new_unordered_set;
+using details::gc_unordered_set;
 
 TGC_DECL_AUTO_BOX(char, gc_char);
 TGC_DECL_AUTO_BOX(unsigned char, gc_uchar);

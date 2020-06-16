@@ -16,8 +16,7 @@
     - Do not need to inherit from a common base.    
     - Can even work with shared_ptr.   
 - Generational marking and sweeping
-    - Won't stop the world.
-    - Can specify the number of steps used for each collecting.
+    - Can customize the trigger condtion of full gc.
     - Can manually delete the object to control the destruction order.
 - Super lightweight    
     - Only one header & CPP file, easier to integrate.
@@ -37,7 +36,7 @@
 - support continuous vector
 - unified way to handle class and containers
 - gc pointer has smaller size
-- not support multi-inheritance
+- do not support multi-inheritance
 - can customize the condition of full collection
 
 

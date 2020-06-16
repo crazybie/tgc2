@@ -150,15 +150,26 @@ struct Val {
   ~Val() { unref++; }
 };
 
-void testContinusVector() {
-  struct Obj {
-    gc<Val> v = gc_new<Val>();
-  };
+struct Obj {
+  gc<Val> v = gc_new<Val>();
+};
 
-  int cnt = 3, clsRegisterCnt = 1;
+void testContinusVector() {
+  unref = 0;
+  int cnt = 3;
+  gc_new<Obj>();  // force registering of Obj
   { auto c = gc_new<vector<Obj>>(cnt); }
   gc_collector()->fullCollect();
-  assert(unref == cnt + clsRegisterCnt);
+  assert(unref == cnt + 1);
+}
+
+void testContinusList() {
+  unref = 0;
+  int cnt = 3;
+  gc_new<Obj>();  // force registering of Obj
+  { auto c = gc_new<list<Obj>>(cnt); }
+  gc_collector()->fullCollect();
+  assert(unref == cnt + 1);
 }
 
 void testCircledContainer() {
@@ -375,7 +386,9 @@ int main() {
   testMoveCtor();
   testCirc();
   testArray();
+
   testContinusVector();
+  testContinusList();
   testList();
   testDeque();
   testHashMap();
