@@ -405,7 +405,7 @@ class gc : public GcPtr<T> {
 
 struct GcCondition {
   virtual ~GcCondition() {}
-  virtual bool needGcNewGen(Collector* c) = 0;
+  virtual bool needMinorGc(Collector* c) = 0;
   virtual bool needFullGc(Collector* c) = 0;
 };
 
@@ -437,7 +437,7 @@ class Collector {
  public:
   static Collector* get();
   void fullCollect();
-  void collectNewGen();
+  void minorCollect();
   void collect();
   void dumpStats();
   void resetCounters() { newGenGcCount = fullGcCount = 0; }
@@ -468,8 +468,8 @@ struct GcCondition_ObjCnt : GcCondition {
   int newGenObjCntToGc = 512;
   size_t oldGenObjCntToFullGc = 1024 * 10;
 
-  bool needGcNewGen(Collector* c) override {
-    return counter++ > newGenObjCntToGc;
+  bool needMinorGc(Collector* c) override {
+    return counter++ % newGenObjCntToGc == 0;
   }
   bool needFullGc(Collector* c) override {
     return c->getOldGenSize() > oldGenObjCntToFullGc;
@@ -483,7 +483,7 @@ struct GcCondition_Time : GcCondition {
   int newGenGcCnt = 0;
   int counter = 0;
 
-  bool needGcNewGen(Collector* c) override {
+  bool needMinorGc(Collector* c) override {
     auto nowClock = clock();
     if (counter++ > 1024 * 10 &&
         nowClock - lastGcTime > (CLOCKS_PER_SEC / 1000 * gcPeriodMs)) {

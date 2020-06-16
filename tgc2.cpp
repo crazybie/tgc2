@@ -88,7 +88,7 @@ void PtrBase::writeBarrier() {
 ObjMeta* ClassMeta::newMeta(size_t cnt) {
   auto* c = Collector::inst ? Collector::inst : Collector::get();
 
-  if (c->gcCond && c->gcCond->needGcNewGen(c))
+  if (c->gcCond && c->gcCond->needMinorGc(c))
     c->collect();
 
   ObjMeta* meta = nullptr;
@@ -274,7 +274,7 @@ void Collector::preMark(ObjMeta* meta) {
   }
 }
 
-void Collector::collectNewGen() {
+void Collector::minorCollect() {
   freeObjCntOfPrevGc = 0;
   newGenGcCount++;
 
@@ -361,7 +361,7 @@ void Collector::collect() {
   if (gcCond && gcCond->needFullGc(this)) {
     fullCollect();
   } else {
-    collectNewGen();
+    minorCollect();
   }
 }
 
